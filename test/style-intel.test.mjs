@@ -207,3 +207,222 @@ test('compare --entry only evaluates chosen stylesheet',t=>{
   assert.equal(run.status,0,run.stderr);
   assert.equal(run.data.summaryCounts.compared,1);
 });
+
+for (const absolute of [false,true]) test(`F1: ${absolute?'absolute':'relative'} project load paths isolate Sass snapshots`,t=>{
+  const root=fixture(t);
+  put(root,'frontend/shared/_tokens.scss','$color: red;');
+  put(root,'frontend/src/styles/main.scss','@use "tokens"; .sample {color: tokens.$color}');
+  git(root,['add','.']);git(root,['commit','-qm','Add Sass entry']);
+  put(root,'frontend/shared/_tokens.scss','$color: blue;');
+  const run=execute('verify',[...args(root),'--entry','src/styles/main.scss',
+    '--load-path',absolute?path.join(root,'frontend/shared'):'frontend/shared']);
+  assert.equal(run.status,2,run.stderr);
+  assert.equal(run.data.summaryCounts.changed,1);
+});
+
+test('F1: relative load paths cannot fill missing historical project imports from worktree',t=>{
+  const root=fixture(t);
+  put(root,'frontend/src/styles/main.scss','@use "newtokens"; .sample {color: newtokens.$color}');
+  git(root,['add','.']);git(root,['commit','-qm','Commit unresolved historical import']);
+  put(root,'frontend/shared/_newtokens.scss','$color: blue;');
+  const run=execute('verify',[...args(root),'--entry','src/styles/main.scss','--load-path','frontend/shared']);
+  assert.equal(run.status,3,run.stderr);
+  assert.equal(run.data.complete,false);
+  assert.equal(run.data.summaryCounts.errors,1);
+});
+
+test('F2: automatically compares underscore-prefixed plain CSS',t=>{
+  const root=fixture(t);
+  put(root,'frontend/src/styles/_theme.css','.theme{color:red}');
+  put(root,'frontend/src/theme.ts',"import './styles/_theme.css';");
+  git(root,['add','.']);git(root,['commit','-qm','Add CSS entry']);
+  put(root,'frontend/src/styles/_theme.css','.theme{color:blue}');
+  const run=execute('verify',args(root));
+  assert.equal(run.status,2,run.stderr);
+  assert.ok(run.data.comparisons.some(x=>x.entry.endsWith('_theme.css')&&x.status==='changed'));
+});
+
+test('F3: tracked generated styles are ignored on both sides',t=>{
+  const root=fixture(t);
+  put(root,'frontend/dist/app.css','.generated{color:red}');
+  git(root,['add','-f','frontend/dist/app.css']);git(root,['commit','-qm','Track generated CSS']);
+  const run=execute('verify',args(root));
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.summaryCounts.compared,3);
+});
+
+test('F3: Git symlink blobs are excluded rather than reconstructed as CSS',t=>{
+  const root=fixture(t);
+  const blob=spawnSync('git',['-C',root,'hash-object','-w','--stdin'],{
+    input:'src/styles/global.css',encoding:'utf8',windowsHide:true});
+  assert.equal(blob.status,0,blob.stderr);
+  git(root,['update-index','--add','--cacheinfo',`120000,${blob.stdout.trim()},frontend/link.css`]);
+  git(root,['commit','-qm','Track CSS symlink']);
+  const run=execute('verify',args(root));
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.summaryCounts.compared,3);
+});
+
+test('F4: scoped comparisons do not traverse unrelated directories',t=>{
+  const root=fixture(t);
+  const hook=`import fs from 'node:fs'; import path from 'node:path';
+    const original=fs.readdirSync;
+    fs.readdirSync=function(dir,...rest){
+      if(path.basename(String(dir))==='backend') throw new Error('Unrelated directory was traversed');
+      return original.call(this,dir,...rest);
+    };`;
+  const r=spawnSync(process.execPath,['--import',`data:text/javascript,${encodeURIComponent(hook)}`,
+    CLI,'verify',...args(root)],{encoding:'utf8',windowsHide:true,timeout:60000});
+  assert.equal(r.status,0,r.stderr);
+  assert.equal(JSON.parse(r.stdout).summaryCounts.compared,3);
+});
+
+test('F5: CSS module references respect parameter, block, and function hoisting shadows',t=>{
+  const root=fixture(t);
+  put(root,'frontend/src/components/CustomerCard.tsx',`
+    import styles from './CustomerCard.module.css';
+    function parameter(styles){return <div className={styles.warning}/>;}
+    function block(){ { const styles={warning:'local'}; return styles['warning']; } }
+    function hoisted(){ return styles.warning; var styles; }
+    export const actual=styles.warning;
+  `);
+  const run=execute('refs',[...args(root),'--selector','.warning','--file','src/components/CustomerCard.module.css']);
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.references.length,1);
+  assert.equal(run.data.references[0].line,6);
+});
+
+test('F6: rejects a scope junction or symlink outside root, including nested scopes',t=>{
+  const root=fixture(t);
+  const outside=fs.mkdtempSync(path.join(os.tmpdir(),'style intel external '));
+  t.after(()=>fs.rmSync(outside,{recursive:true,force:true,maxRetries:2}));
+  put(outside,'nested/outside.css','.outside{color:red}');
+  const link=path.join(root,'external');
+  try {fs.symlinkSync(outside,link,process.platform==='win32'?'junction':'dir');}
+  catch(e){if(['EPERM','EACCES','ENOTSUP'].includes(e.code)){t.skip(e.message);return;}throw e;}
+  try {
+    for(const scope of ['external','external/nested']) {
+      const run=execute('inventory',['--root',root,'--scope',scope,'--format','json']);
+      assert.equal(run.status,3,run.stderr);
+      assert.match(run.stderr,/symlink|symbolic|outside --root/i);
+    }
+    for(const command of ['impact','verify']) {
+      const run=execute(command,[...args(root),command==='impact'?'--file':'--entry',path.join(link,'nested/outside.css')]);
+      assert.equal(run.status,3,run.stderr);
+      assert.match(run.stderr,/symlink|symbolic|outside --root/i);
+    }
+  } finally {
+    // Unlink before fixture cleanup, without traversing the external target.
+    fs.unlinkSync(link);
+  }
+});
+
+for (const command of ['refs','impact','verify']) test(`F7: ${command} rejects incomplete JS/TS parsing`,t=>{
+  const root=fixture(t);
+  put(root,'frontend/src/broken.ts','const x = ;');
+  const extra=command==='refs'?['--selector','.warning']:
+    command==='impact'?['--file','src/styles/global.css']:[];
+  const run=execute(command,[...args(root),...extra]);
+  assert.equal(run.status,3,run.stderr);
+  if(run.data){assert.equal(run.data.complete,false);assert.match(run.data.warnings.join('\n'),/broken.ts/);}
+  else assert.match(run.stderr,/broken.ts/);
+});
+
+test('F8: absolute entries missing from both sides are invalid arguments',t=>{
+  const root=fixture(t);
+  const run=execute('verify',[...args(root),'--entry',path.join(root,'frontend/missing.css')]);
+  assert.equal(run.status,3,run.stderr);
+  assert.match(run.stderr,/not found in either snapshot/i);
+});
+
+for (const loadPath of ['external','node_modules']) test(`F1: preserves shared ${loadPath} Sass dependencies`,t=>{
+  const root=fixture(t);
+  const external=fs.mkdtempSync(path.join(os.tmpdir(),'style intel Sass dependency '));
+  t.after(()=>fs.rmSync(external,{recursive:true,force:true,maxRetries:2}));
+  const dependency=loadPath==='external'?external:path.join(root,'frontend/node_modules/theme');
+  put(dependency,'_tokens.scss','$color: red;');
+  put(root,'frontend/src/styles/main.scss','@use "tokens"; .sample{color:tokens.$color}');
+  git(root,['add','frontend/src/styles/main.scss']);git(root,['commit','-qm','Add shared dependency import']);
+  const run=execute('verify',[...args(root),'--entry','src/styles/main.scss','--load-path',dependency]);
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.summaryCounts.equivalent,1);
+});
+
+test('F4: scoped Sass entries can use checked-in dependencies outside scope',t=>{
+  const root=fixture(t);
+  put(root,'shared/_tokens.scss','$color: red;');
+  put(root,'frontend/src/styles/main.scss','@use "tokens"; .sample{color:tokens.$color}');
+  git(root,['add','.']);git(root,['commit','-qm','Add out of scope Sass dependency']);
+  put(root,'shared/_tokens.scss','$color: blue;');
+  const run=execute('verify',[...args(root),'--entry','src/styles/main.scss','--load-path','shared']);
+  assert.equal(run.status,2,run.stderr);
+  assert.equal(run.data.summaryCounts.changed,1);
+});
+
+test('F8: absolute entries present on only one side retain addition and removal reports',t=>{
+  const root=fixture(t);
+  const removed=path.join(root,'frontend/src/styles/global.css');
+  fs.unlinkSync(removed);
+  put(root,'frontend/added.css','.added{color:blue}');
+  const run=execute('verify',[...args(root),'--entry',removed,'--entry',path.join(root,'frontend/added.css')]);
+  assert.equal(run.status,2,run.stderr);
+  assert.equal(run.data.summaryCounts.changed,2);
+  assert.ok(run.data.comparisons.some(x=>x.details==='Added stylesheet'));
+  assert.ok(run.data.comparisons.some(x=>x.details==='Removed stylesheet'));
+});
+
+
+test('F4: scope-relative explicit entries may point to a sibling within root',t=>{
+  const root=fixture(t);
+  put(root,'shared/entry.css','.shared{color:red}');
+  git(root,['add','.']);git(root,['commit','-qm','Add sibling CSS entry']);
+  const run=execute('verify',[...args(root),'--entry','../shared/entry.css']);
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.summaryCounts.compared,1);
+  assert.equal(run.data.comparisons[0].entry,'shared/entry.css');
+});
+
+test('R1: ignored tracked Sass remains available as a snapshot dependency',t=>{
+  const root=fixture(t);
+  put(root,'frontend/vendor/_tokens.scss','$color: red;');
+  put(root,'frontend/src/main.scss','@use "../vendor/tokens"; .sample{color:tokens.$color}');
+  git(root,['add','-f','frontend/vendor/_tokens.scss','frontend/src/main.scss']);
+  git(root,['commit','-qm','Add ignored Sass dependency']);
+  const unchanged=execute('verify',args(root));
+  assert.equal(unchanged.status,0,unchanged.stderr);
+  assert.equal(unchanged.data.summaryCounts.compared,4);
+  assert.ok(unchanged.data.comparisons.every(x=>!x.entry.includes('/vendor/')));
+  put(root,'frontend/vendor/_tokens.scss','$color: blue;');
+  const changed=execute('verify',args(root));
+  assert.equal(changed.status,2,changed.stderr);
+  assert.ok(changed.data.comparisons.some(x=>x.entry==='frontend/src/main.scss'&&x.status==='changed'));
+});
+
+test('R2: excludes materialized Git symlink placeholders from worktree comparisons',t=>{
+  const root=fixture(t);
+  git(root,['config','core.symlinks','false']);
+  const blob=spawnSync('git',['-C',root,'hash-object','-w','--stdin'],{
+    input:'src/styles/global.css',encoding:'utf8',windowsHide:true});
+  assert.equal(blob.status,0,blob.stderr);
+  git(root,['update-index','--add','--cacheinfo',`120000,${blob.stdout.trim()},frontend/link.css`]);
+  git(root,['commit','-qm','Track CSS symlink']);
+  git(root,['checkout-index','--force','--','frontend/link.css']);
+  assert.equal(fs.lstatSync(path.join(root,'frontend/link.css')).isSymbolicLink(),false);
+  assert.equal(fs.readFileSync(path.join(root,'frontend/link.css'),'utf8'),'src/styles/global.css');
+  const run=execute('verify',args(root));
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.summaryCounts.compared,3);
+  const explicit=execute('verify',[...args(root),'--entry','link.css']);
+  assert.equal(explicit.status,3,explicit.stderr);
+  assert.match(explicit.stderr,/not found in either snapshot/);
+});
+
+
+test('R2: directory-only comparisons work without Git metadata',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'style intel no Git '));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true,maxRetries:2}));
+  put(root,'main.css','.sample{color:red}');
+  const run=execute('verify',['--root',root,'--baseline','worktree','--format','json']);
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.summaryCounts.equivalent,1);
+});

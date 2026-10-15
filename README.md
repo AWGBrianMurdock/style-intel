@@ -116,6 +116,8 @@ The comparison is order-sensitive and intentionally conservative. Treat its resu
 
 Even if the comparison is structurally equal, computed styles may differ because of React rendering, className expressions, routes, CSS bundling, PostCSS plugins, CSS Modules transformations, library versions, or UI state.
 
+Project-local `--load-path` values, including absolute paths, resolve within each snapshot. Paths under `node_modules` and paths outside the repository use the current filesystem on both sides. Missing historical project imports fail verification instead of falling back to working-tree source.
+
 For historical Git comparisons, the current Sass compiler and current accessible `node_modules` are used on **both** sides; historical dependencies are not recreated. This isolates checked-in Sass source differences in many common cases but cannot reproduce historical production builds with dependency changes.
 
 ## Return codes
@@ -132,7 +134,7 @@ Use `$LASTEXITCODE` immediately after the CLI invocation in PowerShell. Structur
 - Native `spawnSync('git', [...], {shell: false, windowsHide:true})` for Git commands: no shell interpolation of user paths or Git ref names.
 - All internal repo paths are normalized to `/` for stable JSON on Windows/Linux; filesystem access still uses OS-native paths.
 - Skips directories such as `.git`, `node_modules`, `dist`, `build`, `target`, `.next`, `coverage`, and symbolic-link directories.
-- Refuses `--scope` and file arguments that escape `--root`; caps traversals at 100,000 files. Narrow `--scope` for a mixed React/Spring Boot repository.
+- Refuses `--scope` and file arguments that escape `--root` or pass through symbolic links/junctions below it; caps traversals at 100,000 files within the selected scope. Narrow `--scope` for a mixed React/Spring Boot repository.
 - Git snapshots are written only to a temporary OS folder and are removed after the command finishes. JSON reports are streamed to stdout and are not saved automatically.
 
 ## Test coverage and known limits

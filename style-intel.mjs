@@ -31,6 +31,14 @@ function ensureUnder(root, full) {
   const rr = process.platform === 'win32' ? r.toLowerCase() : r;
   const pp = process.platform === 'win32' ? p.toLowerCase() : p;
   if (pp !== rr && !pp.startsWith(rr + path.sep)) throw new Error(`Path is outside --root: ${full}`);
+  // Reject symlinks and junctions below root, including intermediate components.
+  // This also protects paths whose final file does not exist.
+  let current=r;
+  for (const part of path.relative(r,p).split(path.sep).filter(Boolean)) {
+    current=path.join(current,part);
+    if (fs.lstatSync(current,{throwIfNoEntry:false})?.isSymbolicLink())
+      throw new Error(`Symbolic link paths are unsupported beneath --root: ${full}`);
+  }
   return p;
 }
 function asRepoPath(root, scope, input) {
@@ -127,7 +135,12 @@ function parseArgs(argv) {
   opts.scope = relative(opts.root, opts.scopeAbs) || '.';
   return opts;
 }
+function eligibleFile(file) {
+  return !slash(file).split('/').slice(0,-1).some(part=>DEFAULT_IGNORES.has(part));
+}
 function walkFiles(root, from = root) {
+  ensureUnder(root,from);
+  if (!eligibleFile(relative(root,from)+'/') || !fs.existsSync(from)) return [];
   const out = [];
   const dirs = [from];
   while (dirs.length) {
@@ -272,7 +285,14 @@ function tsScriptKind(file) {
 }
 function sourceFile(file, abs) {
   const text = fs.readFileSync(abs,'utf8');
-  return ts().createSourceFile(file,text,ts().ScriptTarget.Latest,true,tsScriptKind(file));
+  const t=ts();
+  const sf=t.createSourceFile(file,text,t.ScriptTarget.Latest,true,tsScriptKind(file));
+  if (sf.parseDiagnostics.length) {
+    const diagnostic=sf.parseDiagnostics[0];
+    const position=sf.getLineAndCharacterOfPosition(diagnostic.start ?? 0);
+    throw new Error(`Cannot parse ${file}:${position.line+1}:${position.character+1}: ${t.flattenDiagnosticMessageText(diagnostic.messageText,' ')}`);
+  }
+  return sf;
 }
 function moduleCandidates(spec, importer, known) {
   if (!spec.startsWith('.')) return [];
@@ -307,6 +327,15 @@ function addRef(refs, ref, seen) {
 function containsExactClass(text, className) {
   return String(text).split(/[\s\t\r\n]+/).includes(className);
 }
+function bindingChecker(sf) {
+  // Bind this file without resolving dependencies or performing type checking.
+  const t=ts(), options={noLib:true,noResolve:true,allowJs:true,jsx:t.JsxEmit.Preserve};
+  const host=t.createCompilerHost(options);
+  host.getSourceFile=name=>name===sf.fileName?sf:undefined;
+  host.fileExists=name=>name===sf.fileName;
+  host.readFile=()=>undefined;
+  return t.createProgram([sf.fileName],options,host).getTypeChecker();
+}
 function gatherReferences(opts, queryName, definitions, files, warnings) {
   const sourceFiles = files.filter(f => SCRIPT_EXT.test(f) || /\.html?$/i.test(f));
   const known = new Set(files);
@@ -330,18 +359,25 @@ function gatherReferences(opts, queryName, definitions, files, warnings) {
     let sf;
     try {sf=sourceFile(file,abs);} catch (e) {pushUnique(warnings,`Unreadable source ${file}: ${e.message}`);continue;}
     const {bindings} = importBindings(sf,file,known);
+    const checker=[...bindings.values()].some(f=>moduleDefs.has(f))?bindingChecker(sf):null;
+    function importedSource(identifier) {
+      if (!checker || !bindings.has(identifier.text)) return undefined;
+      const symbol=checker.getSymbolAtLocation(identifier);
+      return symbol?.declarations?.some(d=>(t.isImportClause(d)||t.isNamespaceImport(d)) && d.getSourceFile()===sf)
+        ? bindings.get(identifier.text) : undefined;
+    }
     const line = node => sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1;
     function walk(node, inClassExpr=false) {
       // CSS Modules: imported names are tied to the declaring stylesheet.
       if (t.isPropertyAccessExpression(node) && t.isIdentifier(node.expression)) {
-        const source = bindings.get(node.expression.text);
+        const source = importedSource(node.expression);
         if (source && moduleDefs.has(source) && node.name.text === queryName) {
           addRef(refs,{file,line:line(node),kind:'css-module-property',confidence:'strong',definition:source,
             detail:`${node.expression.text}.${queryName}`},seen);
         }
       }
       if (t.isElementAccessExpression(node) && t.isIdentifier(node.expression)) {
-        const source = bindings.get(node.expression.text);
+        const source = importedSource(node.expression);
         if (source && moduleDefs.has(source)) {
           if (node.argumentExpression && t.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === queryName)
             addRef(refs,{file,line:line(node),kind:'css-module-element',confidence:'strong',definition:source,
@@ -463,7 +499,7 @@ function impactCommand(opts) {
     directConsumers:sort(direct),affectedFiles:affected,
     possibleRoutes:affected.filter(x=>/(?:^|\/)(?:pages?|routes?|views?)\/|(?:^|\/)App\.[tj]sx?$/i.test(x)),
     selectorEvidence:refsReport?{definitions:refsReport.definitions.length,references:refsReport.references.length}:undefined,
-    complete: !refsReport || refsReport.complete, warnings,limitations:['Module imports are resolved only for relative paths; tsconfig aliases, barrels, code-splitting, and runtime routes may be missed',
+    complete: warnings.length===0 && (!refsReport || refsReport.complete), warnings,limitations:['Module imports are resolved only for relative paths; tsconfig aliases, barrels, code-splitting, and runtime routes may be missed',
       'Import reachability is not evidence a component renders or a CSS rule applies']};
 }
 function git(root,args, options={}) {
@@ -490,7 +526,10 @@ function snapshotRevision(opts, rev, tempParent) {
     if (!entry) continue;
     const tab=entry.indexOf('\t');
     const head=entry.slice(0,tab).split(' '), name=entry.slice(tab+1);
-    if (head[1] === 'blob' && (STYLE_EXT.test(name) || (SCRIPT_EXT.test(name) && inScope(name)))) blobs.push({oid:head[2],name});
+    // Materialize all tracked style sources for Sass dependency resolution.
+    // Ignored files stay out of side.files, which controls entry discovery.
+    if (head[1] === 'blob' && ['100644','100755'].includes(head[0]) &&
+        (STYLE_EXT.test(name) || (eligibleFile(name) && SCRIPT_EXT.test(name) && inScope(name)))) blobs.push({oid:head[2],name});
   }
   const snapshot=path.join(tempParent,sha.slice(0,12));
   fs.mkdirSync(snapshot,{recursive:true});
@@ -512,23 +551,65 @@ function snapshotRevision(opts, rev, tempParent) {
       offset=nl+1+size+1;
     }
   }
-  return {kind:'git',revision:sha,path:snapshot,files:blobs.map(x=>x.name)};
+  return {kind:'git',revision:sha,path:snapshot,files:blobs.map(x=>x.name).filter(eligibleFile)};
+}
+function trackedSymlinks(root) {
+  // Directory-only comparisons also work without Git or repository metadata.
+  const probe=spawnSync('git',['-C',root,'rev-parse','--is-inside-work-tree'],{
+    encoding:'utf8',windowsHide:true,timeout:10000,
+  });
+  if (probe.status!==0 || probe.stdout.trim()!=='true') return new Set();
+  const links=new Set();
+  const listing=git(root,['ls-files','--stage','-z']).toString('utf8');
+  for (const entry of listing.split('\0')) {
+    const tab=entry.indexOf('\t');
+    if (tab<0 || entry.slice(0,tab).split(' ')[0]!=='120000') continue;
+    const file=entry.slice(tab+1);
+    links.add(process.platform==='win32'?file.toLowerCase():file);
+  }
+  return links;
+}
+function filesystemSide(opts,root,kind) {
+  const links=trackedSymlinks(root);
+  const eligible=file=>eligibleFile(file) && !links.has(process.platform==='win32'?file.toLowerCase():file);
+  const files=walkFiles(root,path.join(root,opts.scope)).filter(f=>eligible(f)&&(STYLE_EXT.test(f)||SCRIPT_EXT.test(f)));
+  // Explicit entries may live outside scope. Sass reads other dependencies
+  // directly from this side, so discovery need not traverse the whole tree.
+  for (const entry of opts.entries) {
+    const candidates=path.isAbsolute(entry)
+      ? [relative(opts.root,ensureUnder(opts.root,entry))]
+      : [slash(entry),path.posix.join(opts.scope,slash(entry))];
+    for (const file of candidates) {
+      let abs;
+      try {abs=ensureUnder(root,path.resolve(root,file));}
+      catch(error) {
+        // A relative entry has root-relative and scope-relative interpretations.
+        // Discard an invalid interpretation while still trying the other one.
+        if (path.isAbsolute(entry)) throw error;
+        continue;
+      }
+      if (eligible(relative(root,abs)) && STYLE_EXT.test(file) && fs.statSync(abs,{throwIfNoEntry:false})?.isFile())
+        pushUnique(files,relative(root,abs));
+    }
+  }
+  return {kind,revision:null,path:root,files};
 }
 function prepareSide(opts, spec, tempParent) {
-  if (spec.toLowerCase()==='worktree') return {kind:'worktree',revision:null,path:opts.root,
-    files:walkFiles(opts.root).filter(f=>STYLE_EXT.test(f) || SCRIPT_EXT.test(f))};
-  const directory = path.resolve(spec);
-  if (fs.statSync(directory,{throwIfNoEntry:false})?.isDirectory()) {
-    return {kind:'directory',revision:null,path:directory,files:walkFiles(directory).filter(f=>STYLE_EXT.test(f) || SCRIPT_EXT.test(f))};
-  }
+  if (spec.toLowerCase()==='worktree') return filesystemSide(opts,opts.root,'worktree');
+  const directory=path.resolve(spec);
+  if (fs.statSync(directory,{throwIfNoEntry:false})?.isDirectory()) return filesystemSide(opts,directory,'directory');
   return snapshotRevision(opts,spec,tempParent);
 }
 function asEntryList(opts,a,b) {
   const inScope = f => opts.scope==='.' || f === opts.scope || f.startsWith(opts.scope+'/');
-  const all = new Set([...a.files,...b.files].filter(f=>STYLE_EXT.test(f)&&inScope(f)&&!path.posix.basename(f).startsWith('_')));
+  const all = new Set([...a.files,...b.files].filter(f=>STYLE_EXT.test(f)&&inScope(f)&&(!path.posix.basename(f).startsWith('_')||/\.css$/i.test(f))));
   if (opts.entries.length) return sort(opts.entries.map(f=>{
     const r=slash(f);
-    if (path.isAbsolute(f) || /^[A-Za-z]:\//.test(r)) return relative(opts.root,ensureUnder(opts.root,f));
+    if (path.isAbsolute(f) || /^[A-Za-z]:\//.test(r)) {
+      const candidate=relative(opts.root,ensureUnder(opts.root,f));
+      if (a.files.includes(candidate)||b.files.includes(candidate)) return candidate;
+      throw new Error(`--entry not found in either snapshot: ${f}`);
+    }
     const rootCandidate=posix(path.normalize(r));
     const scopeCandidate=path.posix.normalize(path.posix.join(opts.scope,r));
     if (a.files.includes(rootCandidate) || b.files.includes(rootCandidate)) return rootCandidate;
@@ -623,12 +704,20 @@ function compareStyleImportOrder(opts,baseline,candidate,limit) {
   return findings;
 }
 function resolveLoadPaths(opts,side) {
+  const explicit=opts.loadPaths.map(p=>{
+    const absolute=path.resolve(opts.root,p), local=path.relative(opts.root,absolute);
+    const internal=local!=='..' && !local.startsWith('..'+path.sep) && !path.isAbsolute(local);
+    // Current dependency directories are intentionally shared, as documented.
+    // Other project load paths must resolve inside the selected snapshot.
+    return internal && !local.split(path.sep).includes('node_modules')
+      ? ensureUnder(side.path,path.resolve(side.path,local)) : absolute;
+  });
   const candidates=[
     path.join(side.path,opts.scope),side.path,
     path.join(side.path,opts.scope,'src'),
     path.join(opts.root,'node_modules'),
     path.join(opts.root,opts.scope,'node_modules'),
-    ...opts.loadPaths.flatMap(p=>[path.resolve(side.path,p),path.resolve(opts.root,p)]),
+    ...explicit,
   ];
   return [...new Set(candidates.filter(x=>fs.statSync(x,{throwIfNoEntry:false})?.isDirectory()))];
 }
@@ -661,6 +750,7 @@ async function compareCommand(opts, verify=false) {
     for (const entry of entries) {
       const [a,b]=[await compiled(baseline,entry),await compiled(candidate,entry)];
       if (a.error || b.error) {comparisons.push({entry,status:'error',details:`baseline: ${a.error||'OK'}; candidate: ${b.error||'OK'}`});continue;}
+      if (a.missing && b.missing) {comparisons.push({entry,status:'error',details:'Entry absent from both snapshots'});continue;}
       if (a.missing || b.missing) {comparisons.push({entry,status:'changed',details:a.missing?'Added stylesheet':'Removed stylesheet',
         findings:['Entry exists on only one side']});continue;}
       let old,next;
