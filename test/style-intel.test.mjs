@@ -9,7 +9,7 @@ import {fileURLToPath} from 'node:url';
 const CLI=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../style-intel.mjs');
 
 function execute(command,args=[],opts={}) {
-  const r=spawnSync(process.execPath,[CLI,command,...args],{cwd:opts.cwd||process.cwd(),
+  const r=spawnSync(process.execPath,[...(opts.nodeArgs||[]),CLI,command,...args],{cwd:opts.cwd||process.cwd(),
     encoding:'utf8',windowsHide:true,timeout:60000});
   return {status:r.status,stdout:r.stdout,stderr:r.stderr,data:r.stdout.startsWith('{') ? JSON.parse(r.stdout):null};
 }
@@ -99,6 +99,41 @@ test('impact walks module consumers to pages and App but not unrelated files',t=
   assert.ok(run.data.affectedFiles.some(f=>f.endsWith('pages/Dashboard.tsx')));
   assert.ok(run.data.affectedFiles.some(f=>f.endsWith('/App.tsx')));
   assert.ok(!run.data.affectedFiles.some(f=>f.includes('Unrelated.tsx')));
+});
+
+for (const selector of ['.root','.customer-card','.warning']) test(`impact ${selector} reads each script once per command`,t=>{
+  const root=fixture(t);
+  const broken=selector==='.warning';
+  if (broken) put(root,'frontend/src/broken.ts','const x = ;');
+  const countsFile=path.join(root,'script-reads.json');
+  const preload=path.join(root,'count-reads.cjs');
+  put(root,'count-reads.cjs',`
+const fs=require('node:fs'), path=require('node:path');
+const read=fs.readFileSync, counts={};
+const sourceRoot=path.join(__dirname,'frontend')+path.sep;
+fs.readFileSync=function(file,...args) {
+  const name=String(file);
+  if (name.startsWith(sourceRoot) && /\\.[cm]?[jt]sx?$/i.test(name))
+    counts[name]=(counts[name]||0)+1;
+  return read.call(this,file,...args);
+};
+process.on('exit',()=>fs.writeFileSync(${JSON.stringify(countsFile)},JSON.stringify(counts)));
+`);
+  const run=execute('impact',[...args(root),'--selector',selector],{nodeArgs:['--require',preload]});
+  assert.equal(run.status,broken?3:0,run.stderr);
+  assert.equal(run.data.complete,!broken);
+  assert.ok(run.data.affectedFiles.some(f=>f.endsWith('components/CustomerCard.tsx')));
+  assert.ok(run.data.affectedFiles.some(f=>f.endsWith('pages/Dashboard.tsx')));
+  assert.ok(run.data.affectedFiles.some(f=>f.endsWith('/App.tsx')));
+  assert.ok(!run.data.affectedFiles.some(f=>f.includes('Unrelated.tsx')));
+  if (selector==='.customer-card') assert.ok(run.data.affectedFiles.some(f=>f.endsWith('views/status.html')));
+  if (broken) {
+    assert.ok(run.data.warnings.some(w=>w.startsWith('Unreadable frontend/src/broken.ts:')));
+    assert.ok(run.data.warnings.some(w=>w.startsWith('Unreadable source frontend/src/broken.ts:')));
+  }
+  const counts=JSON.parse(fs.readFileSync(countsFile,'utf8'));
+  assert.equal(Object.keys(counts).length,broken?5:4);
+  for (const [file,count] of Object.entries(counts)) assert.equal(count,1,`Repeated script read: ${file}`);
 });
 
 test('compare reports static equality at HEAD and ignores whitespace/comments',t=>{

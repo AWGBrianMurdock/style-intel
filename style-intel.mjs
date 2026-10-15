@@ -336,7 +336,7 @@ function bindingChecker(sf) {
   host.readFile=()=>undefined;
   return t.createProgram([sf.fileName],options,host).getTypeChecker();
 }
-function gatherReferences(opts, queryName, definitions, files, warnings) {
+function gatherReferences(opts, queryName, definitions, files, warnings, scriptImports) {
   const sourceFiles = files.filter(f => SCRIPT_EXT.test(f) || /\.html?$/i.test(f));
   const known = new Set(files);
   const refs=[], dynamic=[], seen = new Set();
@@ -357,8 +357,13 @@ function gatherReferences(opts, queryName, definitions, files, warnings) {
       continue;
     }
     let sf;
-    try {sf=sourceFile(file,abs);} catch (e) {pushUnique(warnings,`Unreadable source ${file}: ${e.message}`);continue;}
-    const {bindings} = importBindings(sf,file,known);
+    try {sf=sourceFile(file,abs);} catch (e) {
+      scriptImports?.set(file,{error:e.message});
+      pushUnique(warnings,`Unreadable source ${file}: ${e.message}`);continue;
+    }
+    const {bindings,imports} = importBindings(sf,file,known);
+    // Retain only import records for graph building, allowing each AST to be released.
+    scriptImports?.set(file,{imports});
     const checker=[...bindings.values()].some(f=>moduleDefs.has(f))?bindingChecker(sf):null;
     function importedSource(identifier) {
       if (!checker || !bindings.has(identifier.text)) return undefined;
@@ -442,7 +447,7 @@ function gatherReferences(opts, queryName, definitions, files, warnings) {
   const dyn = dynamic.filter(d=>d.definition ? moduleDefs.has(d.definition) : anyGlobal);
   return {refs,dynamic:dyn.slice(0,300)};
 }
-function refsCommand(opts, filesArg) {
+function refsCommand(opts, filesArg, scriptImports) {
   if (!opts.selector) throw new Error('refs requires --selector .class-name');
   const name = opts.selector.replace(/^\./,'');
   if (!name || /[\s#\[:>,]/.test(name)) throw new Error('--selector must be one class name (e.g., .customer-card)');
@@ -450,7 +455,7 @@ function refsCommand(opts, filesArg) {
   const warnings=[];
   const cssFiles = opts.file ? files.filter(f=>f===asRepoPath(opts.root,opts.scopeAbs,opts.file)) : files;
   const definitions=styleDefinitions(opts,name,cssFiles,warnings);
-  const {refs,dynamic}=gatherReferences(opts,name,definitions,files,warnings);
+  const {refs,dynamic}=gatherReferences(opts,name,definitions,files,warnings,scriptImports);
   return {tool:'style-intel',version:VERSION,command:'refs',scope:opts.scope,selector:'.'+name,
     summary:`${definitions.length} selector definitions and ${refs.length} candidate references`,
     definitions,references:refs,possibleDynamic:dynamic,complete:warnings.length===0,
@@ -458,15 +463,22 @@ function refsCommand(opts, filesArg) {
       'SCSS interpolation/nesting and TS aliases may evade resolution',
       'No references found never proves a selector is unused']};
 }
-function buildGraph(opts,files,warnings) {
+function buildGraph(opts,files,warnings,scriptImports) {
   const known = new Set(files);
   const reverse = new Map();
   for (const f of files) reverse.set(f,new Set());
   for (const f of files.filter(x=>SCRIPT_EXT.test(x))) {
-    let sf;
-    try { sf=sourceFile(f,path.join(opts.root,f)); }
-    catch (e) {pushUnique(warnings,`Unreadable ${f}: ${e.message}`);continue;}
-    const {imports}=importBindings(sf,f,known);
+    let imports;
+    const cached=scriptImports?.get(f);
+    if (cached) {
+      if (cached.error !== undefined) {pushUnique(warnings,`Unreadable ${f}: ${cached.error}`);continue;}
+      imports=cached.imports;
+    } else {
+      let sf;
+      try { sf=sourceFile(f,path.join(opts.root,f)); }
+      catch (e) {pushUnique(warnings,`Unreadable ${f}: ${e.message}`);continue;}
+      ({imports}=importBindings(sf,f,known));
+    }
     for (const {targets} of imports) for (const target of targets) reverse.get(target)?.add(f);
   }
   return reverse;
@@ -474,17 +486,18 @@ function buildGraph(opts,files,warnings) {
 function impactCommand(opts) {
   if (!opts.file && !opts.selector) throw new Error('impact requires --file PATH or --selector .class');
   const files=walkFiles(opts.root,opts.scopeAbs), warnings=[];
-  const reverse=buildGraph(opts,files,warnings);
+  const scriptImports=opts.selector?new Map():undefined;
   let starting=[];
   let refsReport=null;
   if (opts.selector) {
-    refsReport=refsCommand(opts,files);
+    refsReport=refsCommand(opts,files,scriptImports);
     starting=[...new Set(refsReport.references.filter(r=>['strong','probable'].includes(r.confidence)).map(r=>r.file))];
-    warnings.push(...refsReport.warnings);
   } else {
     starting=[asRepoPath(opts.root,opts.scopeAbs,opts.file)];
     if (!files.includes(starting[0])) throw new Error(`Source file is not in the selected scope: ${starting[0]}`);
   }
+  const reverse=buildGraph(opts,files,warnings,scriptImports);
+  if (refsReport) warnings.push(...refsReport.warnings);
   const queue=[...starting], seen=new Set(starting);
   const direct=new Set();
   for (const start of starting) for (const consumer of reverse.get(start)||[]) direct.add(consumer);
