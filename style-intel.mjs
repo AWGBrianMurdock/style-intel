@@ -9,12 +9,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { snapshotGitBlobs } from './git-snapshot.mjs';
 
 const require = createRequire(import.meta.url);
 const VERSION = '0.1.0';
 const STYLE_EXT = /\.(?:css|scss|sass)$/i;
 const MAIN_STYLE_EXT = /\.(?:css|scss|sass)$/i;
-const SCRIPT_EXT = /\.(?:tsx|jsx|ts|js|mjs|cjs)$/i;
+const SCRIPT_EXT = /\.(?:tsx|jsx|ts|js|mts|cts|mjs|cjs)$/i;
 const DEFAULT_IGNORES = new Set([
   '.git', 'node_modules', 'dist', 'build', 'target', 'coverage', '.next',
   '.angular', '.turbo', '.cache', '.gradle', '.idea', '.venv', 'vendor',
@@ -161,21 +163,33 @@ function display(result, opts) {
   if (opts.format === 'json') {
     // Large JSON responses are expensive for agents; expose counts but cap evidence arrays.
     const payload = {...result};
-    const truncated = {};
+    const truncated = {}, totals = {};
     if (payload.comparisons) payload.comparisons = [
       ...payload.comparisons.filter(c=>c.status!=='structurally-equal'),
       ...payload.comparisons.filter(c=>c.status==='structurally-equal'),
     ];
     for (const key of ['projects','sampleStyles','definitions','references','possibleDynamic',
                        'directConsumers','affectedFiles','possibleRoutes','warnings','comparisons','importChanges']) {
+      if (Array.isArray(payload[key])) totals[key] = payload[key].length;
       if (Array.isArray(payload[key]) && payload[key].length > opts.limit) {
         truncated[key] = payload[key].length - opts.limit;
         payload[key] = payload[key].slice(0,opts.limit);
       }
     }
+    if (payload.importChanges) payload.importChanges=payload.importChanges.map(change=>{
+      const out={...change};
+      for (const side of ['before','after']) {
+        out[side+'Count']=change[side].length;
+        out[side]=change[side].slice(0,opts.limit);
+        if (change[side].length>opts.limit) out['truncated'+side[0].toUpperCase()+side.slice(1)]=change[side].length-opts.limit;
+      }
+      return out;
+    });
     if (payload.comparisons) payload.comparisons = payload.comparisons.map(c => ({
-      ...c,...(c.findings ? {findings:c.findings.slice(0,opts.limit)} : {})
+      ...c,...(c.findings ? {findings:c.findings.slice(0,opts.limit),findingCount:c.findings.length,
+        ...(c.findings.length>opts.limit ? {truncatedFindings:c.findings.length-opts.limit} : {})} : {})
     }));
+    payload.totals = totals;
     if (Object.keys(truncated).length) payload.truncated = truncated;
     process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
     return;
@@ -230,11 +244,11 @@ function inventory(opts) {
   }
   const result = {tool:'style-intel',version:VERSION,command:'inventory',scope:opts.scope,
     summary:`${styles.length} stylesheets, ${js.length} JavaScript/TypeScript files, ${projects.length} project/build manifests`,
-    projects:projects.slice(0,200),
+    projects,
     counts:{files:all.length,css:styles.filter(f=>f.endsWith('.css')).length,
       scss:styles.filter(f=>f.endsWith('.scss')).length,sass:styles.filter(f=>f.endsWith('.sass')).length,
       scripts:js.length,html:all.filter(f=>/\.html?$/i.test(f)).length},
-    sampleStyles:styles.slice(0,opts.limit), warnings:[],
+    sampleStyles:styles, warnings:[],
     limitations:['Folder traversal skips generated/vendor directories and symbolic links','Build manifests do not establish runtime integration']};
   return result;
 }
@@ -297,28 +311,80 @@ function sourceFile(file, abs) {
 function moduleCandidates(spec, importer, known) {
   if (!spec.startsWith('.')) return [];
   const stem = path.posix.normalize(path.posix.join(path.posix.dirname(importer),slash(spec)));
-  const attempts = [stem, ...['.tsx','.ts','.jsx','.js','.mjs','.cjs','.css','.scss','.sass'].map(x=>stem+x),
-    ...['index.tsx','index.ts','index.jsx','index.js','index.css','index.scss'].map(x=>stem+'/'+x)];
-  return attempts.filter(x=>known.has(x));
+  const emitted = {'.js':['.ts','.tsx'],'.jsx':['.tsx'],'.mjs':['.mts'],'.cjs':['.cts']};
+  const ext = path.posix.extname(stem);
+  const attempts = [stem, ...(emitted[ext]||[]).map(x=>stem.slice(0,-ext.length)+x),
+    ...['.tsx','.ts','.jsx','.js','.mts','.cts','.mjs','.cjs','.css','.scss','.sass'].map(x=>stem+x),
+    ...['index.tsx','index.ts','index.jsx','index.js','index.mts','index.cts','index.mjs','index.cjs','index.css','index.scss','index.sass'].map(x=>stem+'/'+x)];
+  const found = attempts.find(x=>known.has(x));
+  return found ? [found] : [];
+}
+function warnUnresolved(imports, file, warnings) {
+  for (const {spec,targets,unsupported} of imports) {
+    if (unsupported) {pushUnique(warnings,unsupported+' in '+file+'; import traversal is incomplete');continue;}
+    if (spec.startsWith('.') && !targets.length &&
+        (!path.posix.extname(spec) || SCRIPT_EXT.test(spec) || STYLE_EXT.test(spec)))
+      pushUnique(warnings,'Unresolved relative import '+JSON.stringify(spec)+' in '+file+' (missing, outside scope, or unsupported resolution)');
+  }
 }
 function importBindings(sf, importer, known) {
   const bindings = new Map();
   const imports = [];
   const t = ts();
+  let checker;
+  const getChecker=()=>checker??=bindingChecker(sf);
   for (const statement of sf.statements) {
     if ((t.isImportDeclaration(statement) || t.isExportDeclaration(statement)) && statement.moduleSpecifier && t.isStringLiteral(statement.moduleSpecifier)) {
       const spec = statement.moduleSpecifier.text;
       const targets = moduleCandidates(spec,importer,known);
       imports.push({spec,targets});
-      if (t.isImportDeclaration(statement) && statement.importClause && targets.length) {
+      // A static CSS Module access is evidence even if the stylesheet is missing.
+      const moduleSource = spec.startsWith('.') && /\.module\.(?:css|scss|sass)$/i.test(spec)
+        ? path.posix.normalize(path.posix.join(path.posix.dirname(importer),slash(spec))) : null;
+      const bindingTarget = moduleSource || targets[0];
+      if (t.isImportDeclaration(statement) && statement.importClause && bindingTarget) {
         const clause = statement.importClause;
-        if (clause.name) bindings.set(clause.name.text, targets[0]);
+        if (clause.name) bindings.set(clause.name.text, bindingTarget);
         if (clause.namedBindings && t.isNamespaceImport(clause.namedBindings))
-          bindings.set(clause.namedBindings.name.text,targets[0]);
+          bindings.set(clause.namedBindings.name.text,bindingTarget);
       }
     }
   }
-  return {bindings,imports};
+  function isNodeRequireFactory(expression) {
+    const member=t.isPropertyAccessExpression(expression);
+    const identifier=member ? expression.expression : expression;
+    if (!t.isIdentifier(identifier)) return false;
+    return getChecker().getSymbolAtLocation(identifier)?.declarations?.some(declaration=>{
+      const named=!member && t.isImportSpecifier(declaration) && (declaration.propertyName||declaration.name).text==='createRequire';
+      const namespace=member && expression.name.text==='createRequire' && (t.isNamespaceImport(declaration)||t.isImportClause(declaration));
+      if (!named && !namespace) return false;
+      let statement=declaration.parent;
+      while (statement && !t.isImportDeclaration(statement)) statement=statement.parent;
+      return statement && ['node:module','module'].includes(statement.moduleSpecifier.text);
+    }) || false;
+  }
+  function calls(node) {
+    if (t.isCallExpression(node)) {
+      if (node.expression.kind===t.SyntaxKind.ImportKeyword) {
+        const arg=node.arguments[0];
+        if (arg && t.isStringLiteralLike(arg)) imports.push({spec:arg.text,targets:moduleCandidates(arg.text,importer,known)});
+        else imports.push({unsupported:'Unsupported computed import() at line '+(sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1)});
+      } else if (t.isIdentifier(node.expression) && node.expression.text==='require') {
+        const symbol=getChecker().getSymbolAtLocation(node.expression);
+        const locallyBound=symbol && (symbol.flags & (t.SymbolFlags.Value|t.SymbolFlags.Alias)) && symbol.declarations?.some(declaration=>{
+          if (declaration.getSourceFile()!==sf || (t.getCombinedModifierFlags(declaration)&t.ModifierFlags.Ambient)) return false;
+          // A locally created Node loader still performs module loading. Other
+          // local functions, parameters and imported helpers do not imply it.
+          return !(t.isVariableDeclaration(declaration) && declaration.initializer &&
+            t.isCallExpression(declaration.initializer) && isNodeRequireFactory(declaration.initializer.expression));
+        });
+        if (!locallyBound) imports.push({unsupported:'Unsupported require() call at line '+(sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1)});
+      }
+    }
+    t.forEachChild(node,calls);
+  }
+  calls(sf);
+  return {bindings,imports,getChecker};
 }
 function addRef(refs, ref, seen) {
   const key = `${ref.file}:${ref.line}:${ref.kind}:${ref.definition || ''}`;
@@ -336,35 +402,60 @@ function bindingChecker(sf) {
   host.readFile=()=>undefined;
   return t.createProgram([sf.fileName],options,host).getTypeChecker();
 }
+// Match tags and attributes, skipping comments and raw-text element contents.
+function htmlClasses(source) {
+  const found=[];
+  const tags=/<!--[\s\S]*?(?:-->|$)|<![^>]*>|<\/?([a-z][\w:-]*)\b(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
+  let tag;
+  while ((tag=tags.exec(source))) {
+    if (!tag[1] || tag[0].startsWith('</')) continue;
+    const name=tag[1].toLowerCase();
+    const offset=tag[0].indexOf(tag[1])+tag[1].length;
+    const attrs=tag[0].slice(offset,-1);
+    const attribute=/([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>\x60]+)))?/g;
+    let attr;
+    while ((attr=attribute.exec(attrs))) {
+      if (attr[1].toLowerCase()==='class') found.push({
+        value:attr[2]??attr[3]??attr[4]??'',index:tag.index+offset+attr.index});
+    }
+    if (/^(?:script|style|textarea|title|xmp|iframe|noembed|noframes|plaintext)$/.test(name)) {
+      const close=new RegExp('</'+name+'\\s*>','gi');
+      close.lastIndex=tags.lastIndex;
+      const end=close.exec(source);
+      tags.lastIndex=end ? close.lastIndex : source.length;
+    }
+  }
+  return found;
+}
 function gatherReferences(opts, queryName, definitions, files, warnings, scriptImports) {
   const sourceFiles = files.filter(f => SCRIPT_EXT.test(f) || /\.html?$/i.test(f));
   const known = new Set(files);
   const refs=[], dynamic=[], seen = new Set();
   const moduleDefs = new Set(definitions.filter(d=>d.module).map(d=>d.file));
   const anyGlobal = definitions.some(d=>!d.module);
+  const selected=opts.file ? asRepoPath(opts.root,opts.scopeAbs,opts.file) : null;
+  const moduleAllowed=f=>/\.module\.(?:css|scss|sass)$/i.test(f) && (!selected || f===selected);
   const t = ts();
-  function refAllowed(defFile) { return !defFile || moduleDefs.has(defFile); }
   for (const file of sourceFiles) {
     const abs = path.join(opts.root,file);
     if (/\.html?$/i.test(file)) {
       if (!anyGlobal) continue;
       const source = fs.readFileSync(abs,'utf8');
-      let match; const re = /\bclass\s*=\s*["']([^"']+)["']/g;
-      while ((match = re.exec(source))) {
-        if (containsExactClass(match[1],queryName)) addRef(refs,{file,line:1+source.slice(0,match.index).split('\n').length-1,
-          kind:'html-class',confidence:'strong',detail:match[1]},seen);
+      for (const attr of htmlClasses(source)) {
+        if (containsExactClass(attr.value,queryName)) addRef(refs,{file,line:source.slice(0,attr.index).split('\n').length,
+          kind:'html-class',confidence:'strong',detail:attr.value},seen);
       }
       continue;
     }
     let sf;
     try {sf=sourceFile(file,abs);} catch (e) {
       scriptImports?.set(file,{error:e.message});
-      pushUnique(warnings,`Unreadable source ${file}: ${e.message}`);continue;
+      pushUnique(warnings,'Unreadable source '+file+': '+e.message);continue;
     }
-    const {bindings,imports} = importBindings(sf,file,known);
-    // Retain only import records for graph building, allowing each AST to be released.
+    const {bindings,imports,getChecker} = importBindings(sf,file,known);
     scriptImports?.set(file,{imports});
-    const checker=[...bindings.values()].some(f=>moduleDefs.has(f))?bindingChecker(sf):null;
+    warnUnresolved(imports,file,warnings);
+    const checker=[...bindings.values()].some(f=>/\.module\.(?:css|scss|sass)$/i.test(f))?getChecker():null;
     function importedSource(identifier) {
       if (!checker || !bindings.has(identifier.text)) return undefined;
       const symbol=checker.getSymbolAtLocation(identifier);
@@ -372,55 +463,96 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
         ? bindings.get(identifier.text) : undefined;
     }
     const line = node => sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1;
+    const moduleEvidence=source=>({definition:source,stylesheet:source,definitionFound:moduleDefs.has(source)});
+    const fallback=[];
+    function unclassified(node) {
+      // Comments are not AST literals. Exclude module names, property keys,
+      // element indices and JSX attributes from speculative string evidence.
+      for (let p=node.parent;p;p=p.parent) {
+        if (t.isJsxAttribute(p) || t.isImportDeclaration(p) || t.isExportDeclaration(p)) return false;
+      }
+      const p=node.parent;
+      return !(t.isElementAccessExpression(p) && p.argumentExpression===node) &&
+        !((t.isPropertyAssignment(p)||t.isMethodDeclaration(p)) && p.name===node);
+    }
     function walk(node, inClassExpr=false) {
-      // CSS Modules: imported names are tied to the declaring stylesheet.
       if (t.isPropertyAccessExpression(node) && t.isIdentifier(node.expression)) {
         const source = importedSource(node.expression);
-        if (source && moduleDefs.has(source) && node.name.text === queryName) {
-          addRef(refs,{file,line:line(node),kind:'css-module-property',confidence:'strong',definition:source,
-            detail:`${node.expression.text}.${queryName}`},seen);
-        }
+        if (source && moduleAllowed(source) && node.name.text === queryName)
+          addRef(refs,{file,line:line(node),kind:'css-module-property',confidence:'strong',...moduleEvidence(source),
+            detail:node.expression.text+'.'+queryName},seen);
       }
       if (t.isElementAccessExpression(node) && t.isIdentifier(node.expression)) {
         const source = importedSource(node.expression);
-        if (source && moduleDefs.has(source)) {
-          if (node.argumentExpression && t.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === queryName)
-            addRef(refs,{file,line:line(node),kind:'css-module-element',confidence:'strong',definition:source,
-              detail:`${node.expression.text}[${JSON.stringify(queryName)}]`},seen);
-          else if (!node.argumentExpression || !t.isStringLiteralLike(node.argumentExpression))
-            dynamic.push({file,line:line(node),kind:'dynamic-css-module-index',definition:source});
+        if (source && /\.module\.(?:css|scss|sass)$/i.test(source)) {
+          if (moduleAllowed(source)) {
+            if (node.argumentExpression && t.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === queryName)
+              addRef(refs,{file,line:line(node),kind:'css-module-element',confidence:'strong',...moduleEvidence(source),
+                detail:node.expression.text+'['+JSON.stringify(queryName)+']'},seen);
+            else if (!node.argumentExpression || !t.isStringLiteralLike(node.argumentExpression))
+              dynamic.push({file,line:line(node),kind:'dynamic-css-module-index',...moduleEvidence(source)});
+          }
+          if (node.argumentExpression) walk(node.argumentExpression,false);
+          return; // A module key is not a literal global class.
         }
       }
-      if (t.isJsxAttribute(node) && (node.name.text === 'className' || node.name.text === 'class')) {
+      if (t.isElementAccessExpression(node)) {
+        walk(node.expression,inClassExpr);
+        if (node.argumentExpression) walk(node.argumentExpression,false);
+        return;
+      }
+      if (t.isJsxAttribute(node)) {
+        if (node.name.text !== 'className' && node.name.text !== 'class') {
+          t.forEachChild(node,child=>walk(child,false));return;
+        }
         if (node.initializer && t.isStringLiteral(node.initializer)) {
           if (anyGlobal && containsExactClass(node.initializer.text,queryName))
             addRef(refs,{file,line:line(node),kind:'jsx-class',confidence:'strong',detail:node.initializer.text},seen);
         } else if (node.initializer && t.isJsxExpression(node.initializer)) {
           if (node.initializer.expression) walk(node.initializer.expression,true);
-          // Do not recurse again: avoids mistaking CSS Modules strings as global classes.
           return;
         }
       }
-      if (t.isStringLiteralLike(node) && inClassExpr && anyGlobal) {
-        if (containsExactClass(node.text,queryName))
-          addRef(refs,{file,line:line(node),kind:'jsx-class-expression',confidence:'probable',detail:node.text.slice(0,120)},seen);
+      if (inClassExpr && t.isConditionalExpression(node)) {
+        walk(node.condition,false);walk(node.whenTrue,true);walk(node.whenFalse,true);return;
       }
-      // clsx({ 'active-state': predicate }) or { active: predicate } inside className expression
-      if (inClassExpr && (t.isPropertyAssignment(node) || t.isShorthandPropertyAssignment(node)) && anyGlobal) {
+      if (inClassExpr && t.isBinaryExpression(node)) {
+        const op=node.operatorToken.kind;
+        walk(node.left,op===t.SyntaxKind.PlusToken || op===t.SyntaxKind.BarBarToken || op===t.SyntaxKind.QuestionQuestionToken);
+        walk(node.right,[t.SyntaxKind.PlusToken,t.SyntaxKind.AmpersandAmpersandToken,t.SyntaxKind.BarBarToken,t.SyntaxKind.QuestionQuestionToken].includes(op));
+        return;
+      }
+      if (t.isStringLiteralLike(node) && anyGlobal) {
+        if (inClassExpr && containsExactClass(node.text,queryName))
+          addRef(refs,{file,line:line(node),kind:'jsx-class-expression',confidence:'probable',detail:node.text.slice(0,120)},seen);
+        else if (!inClassExpr && node.text===queryName && unclassified(node))
+          fallback.push({file,line:line(node),kind:'unclassified-string',confidence:'possible',detail:queryName});
+      }
+      if (inClassExpr && (t.isPropertyAssignment(node) || t.isShorthandPropertyAssignment(node))) {
         const key = node.name && (t.isIdentifier(node.name) || t.isStringLiteral(node.name)) ? node.name.text : null;
-        if (key === queryName) addRef(refs,{file,line:line(node),kind:'class-object-key',confidence:'probable',detail:key},seen);
+        if (anyGlobal && key === queryName) addRef(refs,{file,line:line(node),kind:'class-object-key',confidence:'probable',detail:key},seen);
+        if (t.isPropertyAssignment(node)) walk(node.initializer,false);
+        return;
       }
       if (inClassExpr && t.isTemplateExpression(node)) {
         dynamic.push({file,line:line(node),kind:'dynamic-class-template'});
+        const parts=[node.head.text,...node.templateSpans.map(x=>x.literal.text)];
         if (anyGlobal) {
-          const parts=[node.head.text,...node.templateSpans.map(x=>x.literal.text)];
-          if (parts.some(part=>containsExactClass(part,queryName)))
+          // Do not treat interpolation boundaries as complete class tokens.
+          if (containsExactClass(parts.join('\0'),queryName))
             addRef(refs,{file,line:line(node),kind:'static-template-segment',confidence:'probable',detail:queryName},seen);
           else if (parts.some(part=>part.trim() && queryName.startsWith(part.trim())))
             addRef(refs,{file,line:line(node),kind:'dynamic-template-prefix',confidence:'possible',detail:parts.join('...').slice(0,120)},seen);
         }
+        for (let i=0;i<node.templateSpans.length;i++) {
+          // Only promote interpolated values when surrounding literals delimit
+          // whole tokens. Adjacent unknown values or glued prefixes may compose a class.
+          const leftBoundary=(i===0 && parts[i]==='') || /\s$/.test(parts[i]);
+          const rightBoundary=(i===node.templateSpans.length-1 && parts[i+1]==='') || /^\s/.test(parts[i+1]);
+          walk(node.templateSpans[i].expression,leftBoundary && rightBoundary);
+        }
+        return;
       }
-      // Also pick up classList.add/remove or class-map strings outside JSX as possible usage.
       if (t.isCallExpression(node) && t.isPropertyAccessExpression(node.expression) &&
           ['add','remove','toggle','contains','replace'].includes(node.expression.name.text) &&
           t.isPropertyAccessExpression(node.expression.expression) && node.expression.expression.name.text === 'classList' && anyGlobal) {
@@ -429,23 +561,14 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
       }
       t.forEachChild(node, child=>walk(child,inClassExpr));
     }
+    const firstRef=refs.length;
     walk(sf,false);
-    // Search exact JS strings outside JSX as a fallback. This is NOT proof of runtime class use.
-    if (anyGlobal) {
-      const source = sf.text;
-      const safe = queryName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-      const occurrences = [...source.matchAll(new RegExp(`(['"\\x60])${safe}\\1`,'g'))].slice(0,50);
-      for (const m of occurrences) {
-        const ln=source.slice(0,m.index).split('\n').length;
-        if (!refs.some(x=>x.file===file && x.line===ln && x.confidence!=='possible'))
-          addRef(refs,{file,line:ln,kind:'unclassified-string',confidence:'possible',detail:queryName},seen);
-      }
-    }
+    const classifiedLines=new Set(refs.slice(firstRef).filter(r=>r.confidence!=='possible').map(r=>r.line));
+    for (const ref of fallback) if (!classifiedLines.has(ref.line)) addRef(refs,ref,seen);
   }
   const confidenceRank={strong:0,probable:1,possible:2};
   refs.sort((a,b)=>confidenceRank[a.confidence]-confidenceRank[b.confidence] || a.file.localeCompare(b.file)||a.line-b.line||a.kind.localeCompare(b.kind));
-  const dyn = dynamic.filter(d=>d.definition ? moduleDefs.has(d.definition) : anyGlobal);
-  return {refs,dynamic:dyn.slice(0,300)};
+  return {refs,dynamic:dynamic.filter(d=>d.definition ? moduleAllowed(d.definition) : anyGlobal)};
 }
 function refsCommand(opts, filesArg, scriptImports) {
   if (!opts.selector) throw new Error('refs requires --selector .class-name');
@@ -479,7 +602,8 @@ function buildGraph(opts,files,warnings,scriptImports) {
       catch (e) {pushUnique(warnings,`Unreadable ${f}: ${e.message}`);continue;}
       ({imports}=importBindings(sf,f,known));
     }
-    for (const {targets} of imports) for (const target of targets) reverse.get(target)?.add(f);
+    warnUnresolved(imports,f,warnings);
+    for (const {targets=[]} of imports) for (const target of targets) reverse.get(target)?.add(f);
   }
   return reverse;
 }
@@ -497,22 +621,22 @@ function impactCommand(opts) {
     if (!files.includes(starting[0])) throw new Error(`Source file is not in the selected scope: ${starting[0]}`);
   }
   const reverse=buildGraph(opts,files,warnings,scriptImports);
-  if (refsReport) warnings.push(...refsReport.warnings);
+  if (refsReport) for (const warning of refsReport.warnings) pushUnique(warnings,warning);
   const queue=[...starting], seen=new Set(starting);
   const direct=new Set();
   for (const start of starting) for (const consumer of reverse.get(start)||[]) direct.add(consumer);
-  while(queue.length) {
-    const file=queue.shift();
+  for (let cursor=0;cursor<queue.length;cursor++) {
+    const file=queue[cursor];
     for (const consumer of reverse.get(file)||[]) if (!seen.has(consumer)) {seen.add(consumer);queue.push(consumer);}
   }
   const affected=sort(seen);
   return {tool:'style-intel',version:VERSION,command:'impact',scope:opts.scope,
-    input:opts.file?{file:starting[0]}:{selector:opts.selector},
+    input:opts.selector ? {selector:opts.selector,...(opts.file ? {file:asRepoPath(opts.root,opts.scopeAbs,opts.file)} : {})} : {file:starting[0]},
     summary:`${starting.length} seeds, ${direct.size} direct importers, ${affected.length} potentially related files`,
     directConsumers:sort(direct),affectedFiles:affected,
     possibleRoutes:affected.filter(x=>/(?:^|\/)(?:pages?|routes?|views?)\/|(?:^|\/)App\.[tj]sx?$/i.test(x)),
     selectorEvidence:refsReport?{definitions:refsReport.definitions.length,references:refsReport.references.length}:undefined,
-    complete: warnings.length===0 && (!refsReport || refsReport.complete), warnings,limitations:['Module imports are resolved only for relative paths; tsconfig aliases, barrels, code-splitting, and runtime routes may be missed',
+    complete: warnings.length===0 && (!refsReport || refsReport.complete), warnings,limitations:['Relative ES imports, re-exports and static import() calls are traversed; tsconfig aliases, require() calls, computed imports and runtime routes may be missed',
       'Import reachability is not evidence a component renders or a CSS rule applies']};
 }
 function git(root,args, options={}) {
@@ -526,7 +650,7 @@ function git(root,args, options={}) {
   }
   return result.stdout;
 }
-function snapshotRevision(opts, rev, tempParent) {
+async function snapshotRevision(opts, rev, tempParent) {
   // Resolve to immutable commit ID and use one `cat-file --batch` invocation.
   // No shell; filenames are copied only beneath a unique OS temporary directory.
   if (rev.startsWith('-') || /[\r\n\0]/.test(rev)) throw new Error('Invalid Git revision');
@@ -546,24 +670,8 @@ function snapshotRevision(opts, rev, tempParent) {
   }
   const snapshot=path.join(tempParent,sha.slice(0,12));
   fs.mkdirSync(snapshot,{recursive:true});
-  if (blobs.length) {
-    const data=git(opts.root,['cat-file','--batch'],{input:Buffer.from(blobs.map(x=>x.oid).join('\n')+'\n')});
-    let offset=0;
-    for (const item of blobs) {
-      const nl=data.indexOf(10,offset);
-      if (nl < 0) throw new Error('Malformed Git cat-file output (missing header)');
-      const header=data.subarray(offset,nl).toString('utf8');
-      const m=/^[a-f\d]+ blob (\d+)$/.exec(header);
-      if (!m) throw new Error(`Malformed Git cat-file output: ${header}`);
-      const size=Number(m[1]);
-      const contents=data.subarray(nl+1,nl+1+size);
-      if (contents.length !== size || data[nl+1+size] !== 10) throw new Error('Incomplete Git blob in cat-file output');
-      const target=ensureUnder(snapshot,path.resolve(snapshot,item.name));
-      fs.mkdirSync(path.dirname(target),{recursive:true});
-      fs.writeFileSync(target,contents);
-      offset=nl+1+size+1;
-    }
-  }
+  if (blobs.length) await snapshotGitBlobs(opts.root,blobs,item=>
+    ensureUnder(snapshot,path.resolve(snapshot,item.name)));
   return {kind:'git',revision:sha,path:snapshot,files:blobs.map(x=>x.name).filter(eligibleFile)};
 }
 function trackedSymlinks(root) {
@@ -607,11 +715,13 @@ function filesystemSide(opts,root,kind) {
   }
   return {kind,revision:null,path:root,files};
 }
-function prepareSide(opts, spec, tempParent) {
-  if (spec.toLowerCase()==='worktree') return filesystemSide(opts,opts.root,'worktree');
+async function prepareSide(opts, spec, tempParent) {
   const directory=path.resolve(spec);
-  if (fs.statSync(directory,{throwIfNoEntry:false})?.isDirectory()) return filesystemSide(opts,directory,'directory');
-  return snapshotRevision(opts,spec,tempParent);
+  const side=spec.toLowerCase()==='worktree' ? filesystemSide(opts,opts.root,'worktree')
+    : fs.statSync(directory,{throwIfNoEntry:false})?.isDirectory() ? filesystemSide(opts,directory,'directory')
+    : await snapshotRevision(opts,spec,tempParent);
+  side.fileSet=new Set(side.files);
+  return side;
 }
 function asEntryList(opts,a,b) {
   const inScope = f => opts.scope==='.' || f === opts.scope || f.startsWith(opts.scope+'/');
@@ -620,13 +730,13 @@ function asEntryList(opts,a,b) {
     const r=slash(f);
     if (path.isAbsolute(f) || /^[A-Za-z]:\//.test(r)) {
       const candidate=relative(opts.root,ensureUnder(opts.root,f));
-      if (a.files.includes(candidate)||b.files.includes(candidate)) return candidate;
+      if (a.fileSet.has(candidate)||b.fileSet.has(candidate)) return candidate;
       throw new Error(`--entry not found in either snapshot: ${f}`);
     }
     const rootCandidate=posix(path.normalize(r));
     const scopeCandidate=path.posix.normalize(path.posix.join(opts.scope,r));
-    if (a.files.includes(rootCandidate) || b.files.includes(rootCandidate)) return rootCandidate;
-    if (a.files.includes(scopeCandidate) || b.files.includes(scopeCandidate)) return scopeCandidate;
+    if (a.fileSet.has(rootCandidate) || b.fileSet.has(rootCandidate)) return rootCandidate;
+    if (a.fileSet.has(scopeCandidate) || b.fileSet.has(scopeCandidate)) return scopeCandidate;
     throw new Error(`--entry not found in either snapshot: ${f}`);
   }));
   return sort(all);
@@ -635,15 +745,23 @@ function canonicalCss(source, label) {
   const ast=postcss().parse(source,{from:label});
   const nodes=[];
   const blocks=[];
+  const declaration=n=>{
+    // PostCSS moves * and _ property hacks to the end of raws.before, which
+    // can also contain insignificant whitespace and empty declarations.
+    const prefix=(n.raws.before||'').match(/[*_]$/)?.[0] || '';
+    return [prefix+n.prop,n.value.trim(),!!n.important];
+  };
+  const selector=n=>selectorParser()().processSync(n.selector,{lossless:false});
   function visit(container,parents) {
     for (const n of (container.nodes||[])) {
       if (n.type === 'comment') continue;
       if (n.type === 'decl') {
-        nodes.push(['decl',n.prop,n.value.trim(),!!n.important]);
+        nodes.push(['decl',...declaration(n)]);
       } else if (n.type === 'rule') {
-        nodes.push(['rule',n.selector.trim()]);
-        const declarations=(n.nodes||[]).filter(x=>x.type==='decl').map(x=>[x.prop,x.value.trim(),!!x.important]);
-        blocks.push({context:parents,selector:n.selector.trim(),declarations});
+        const normalized=selector(n);
+        nodes.push(['rule',normalized]);
+        const declarations=(n.nodes||[]).filter(x=>x.type==='decl').map(declaration);
+        blocks.push({context:parents,selector:normalized,declarations});
         visit(n,parents);
         nodes.push(['/rule']);
       } else if (n.type === 'atrule') {
@@ -666,7 +784,7 @@ function countDelta(before,after) {
   for (const [s,n] of b) minus+=Math.max(0,n-(a.get(s)||0));
   return {added:plus,removed:minus};
 }
-function summarizeDifference(before,after,limit) {
+function summarizeDifference(before,after) {
   const old=before.blocks.map(x=>JSON.stringify(x)), newer=after.blocks.map(x=>JSON.stringify(x));
   const delta=countDelta(old,newer);
   const nodeDelta=countDelta(before.nodes.map(JSON.stringify),after.nodes.map(JSON.stringify));
@@ -678,24 +796,22 @@ function summarizeDifference(before,after,limit) {
     const oldBag=bag(old), newBag=bag(newer);
     for (const b of after.blocks) if ((oldBag.get(JSON.stringify(b))||0) < (newBag.get(JSON.stringify(b))||0)) {
       findings.push(`Added/modified: ${[...b.context,b.selector].join(' > ')}`);
-      if (findings.length>=limit) break;
     }
     for (const b of before.blocks) if (!newBag.has(JSON.stringify(b))) {
       findings.push(`Removed/modified: ${[...b.context,b.selector].join(' > ')}`);
-      if (findings.length>=limit) break;
     }
   }
   if (before.nodes.length !== after.nodes.length) findings.push(`CSS AST node counts: ${before.nodes.length} → ${after.nodes.length}`);
-  return {reorderedOnly:sameMultiset,findings:findings.slice(0,limit)};
+  return {reorderedOnly:sameMultiset,findings};
 }
 function directImports(side,file) {
-  if (!side.files.includes(file)) return [];
+  if (!side.fileSet.has(file)) return [];
   const sf=sourceFile(file,path.join(side.path,file));
   return sf.statements
     .filter(x=>ts().isImportDeclaration(x) && x.moduleSpecifier && ts().isStringLiteral(x.moduleSpecifier))
     .map(x=>x.moduleSpecifier.text);
 }
-function compareStyleImportOrder(opts,baseline,candidate,limit) {
+function compareStyleImportOrder(opts,baseline,candidate) {
   // React bundlers may have observable order-dependent CSS imports. An identical
   // compiled Sass AST is not sufficient when frontend import order changes.
   const inScope=f=>opts.scope==='.' || f.startsWith(opts.scope+'/');
@@ -725,21 +841,16 @@ function resolveLoadPaths(opts,side) {
     return internal && !local.split(path.sep).includes('node_modules')
       ? ensureUnder(side.path,path.resolve(side.path,local)) : absolute;
   });
-  const candidates=[
-    path.join(side.path,opts.scope),side.path,
-    path.join(side.path,opts.scope,'src'),
-    path.join(opts.root,'node_modules'),
-    path.join(opts.root,opts.scope,'node_modules'),
-    ...explicit,
-  ];
-  return [...new Set(candidates.filter(x=>fs.statSync(x,{throwIfNoEntry:false})?.isDirectory()))];
+  // Sass resolves relative imports itself. Only explicitly supplied include paths
+  // are valid; root/src/node_modules guesses can rescue invalid imports.
+  return [...new Set(explicit)];
 }
 async function compareCommand(opts, verify=false) {
   const warnings=[], comparisons=[];
   const temp=fs.mkdtempSync(path.join(os.tmpdir(),'style-intel-'));
   let compiler=null;
   try {
-    const baseline=prepareSide(opts,opts.baseline,temp), candidate=prepareSide(opts,opts.candidate,temp);
+    const baseline=await prepareSide(opts,opts.baseline,temp), candidate=await prepareSide(opts,opts.candidate,temp);
     const entries=asEntryList(opts,baseline,candidate);
     if (!entries.length) warnings.push('No non-partial CSS/SCSS/Sass entries found in scope');
     if (entries.some(f=>/\.(scss|sass)$/i.test(f))) {
@@ -750,35 +861,51 @@ async function compareCommand(opts, verify=false) {
       else compiler={compileAsync:(...args)=>sass.compileAsync(...args),dispose:async()=>{}};
     }
     async function compiled(side,file) {
-      if (!side.files.includes(file)) return {missing:true};
+      if (!side.fileSet.has(file)) return {missing:true};
       const abs=ensureUnder(side.path,path.join(side.path,file));
       if (!fs.existsSync(abs)) return {error:'File absent from snapshot despite listing'};
       if (/\.css$/i.test(file)) return {css:fs.readFileSync(abs,'utf8')};
       try {
         const result=await compiler.compileAsync(abs,{style:'expanded',loadPaths:resolveLoadPaths(opts,side),
           sourceMap:false,quietDeps:true,logger:{warn:()=>{},debug:()=>{}}});
+        // Absolute imports and external junctions must not bypass snapshot
+        // isolation. Inspect actual loaded files, not just configured load paths.
+        if (path.relative(opts.root,side.path)!=='') {
+          const project=fs.realpathSync(opts.root), snapshot=fs.realpathSync(side.path);
+          for (const url of result.loadedUrls||[]) {
+            if (url.protocol!=='file:') continue;
+            const loaded=fs.realpathSync(fileURLToPath(url));
+            const fromSnapshot=path.relative(snapshot,loaded), fromProject=path.relative(project,loaded);
+            const inside=p=>p!=='..' && !p.startsWith('..'+path.sep) && !path.isAbsolute(p);
+            if (!inside(fromSnapshot) && inside(fromProject) && !fromProject.split(path.sep).includes('node_modules'))
+              throw new Error('Snapshot isolation failed: Sass loaded current project source '+loaded+'. Use relative imports or project --load-path values so historical source comes from the snapshot.');
+          }
+        }
         return {css:result.css};
-      } catch(e) {return {error:String(e.message).split('\n').slice(0,5).join(' | ')};}
+      } catch(e) {return {error:String(e.message).split('\n').slice(0,5).join(' | ')+'; If the build uses Sass include paths, pass --load-path explicitly.'};}
     }
     for (const entry of entries) {
       const [a,b]=[await compiled(baseline,entry),await compiled(candidate,entry)];
       if (a.error || b.error) {comparisons.push({entry,status:'error',details:`baseline: ${a.error||'OK'}; candidate: ${b.error||'OK'}`});continue;}
       if (a.missing && b.missing) {comparisons.push({entry,status:'error',details:'Entry absent from both snapshots'});continue;}
+      let old,next;
+      try {
+        if (!a.missing) old=canonicalCss(a.css,entry);
+        if (!b.missing) next=canonicalCss(b.css,entry);
+      }
+      catch(e) {comparisons.push({entry,status:'error',details:`CSS parsing failed: ${e.message}`});continue;}
       if (a.missing || b.missing) {comparisons.push({entry,status:'changed',details:a.missing?'Added stylesheet':'Removed stylesheet',
         findings:['Entry exists on only one side']});continue;}
-      let old,next;
-      try {old=canonicalCss(a.css,entry);next=canonicalCss(b.css,entry);}
-      catch(e) {comparisons.push({entry,status:'error',details:`CSS parsing failed: ${e.message}`});continue;}
       if (JSON.stringify(old.nodes)===JSON.stringify(next.nodes)) {
         comparisons.push({entry,status:'structurally-equal',rules:next.ruleCount});
       } else {
-        const d=summarizeDifference(old,next,opts.limit);
+        const d=summarizeDifference(old,next);
         comparisons.push({entry,status:d.reorderedOnly?'reordered':'changed',
           details:d.reorderedOnly?'Possible cascade change':'CSS AST differs',
           findings:d.findings,rulesBefore:old.ruleCount,rulesAfter:next.ruleCount});
       }
     }
-    const importChanges=compareStyleImportOrder(opts,baseline,candidate,opts.limit);
+    const importChanges=compareStyleImportOrder(opts,baseline,candidate);
     const stats={compared:comparisons.length,equivalent:comparisons.filter(x=>x.status==='structurally-equal').length,
       changed:comparisons.filter(x=>['changed','reordered'].includes(x.status)).length,
       errors:comparisons.filter(x=>x.status==='error').length,importOrderChanges:importChanges.length};
@@ -786,6 +913,7 @@ async function compareCommand(opts, verify=false) {
       baseline:baseline.kind==='git'?baseline.revision:baseline.kind,
       candidate:candidate.kind==='git'?candidate.revision:candidate.kind,
       summary:`${stats.equivalent}/${stats.compared} static CSS AST comparisons equal; ${importChanges.length} potential CSS import-order changes`,
+      verification:{staticCss:true,applicationBuild:false,browser:false},
       summaryCounts:stats,complete:stats.errors===0&&stats.compared>0,comparisons,importChanges,warnings,
       limitations:[
         'AST structural equality is NOT computed-style or visual equivalence',
@@ -796,8 +924,8 @@ async function compareCommand(opts, verify=false) {
       ]};
     return result;
   } finally {
-    if (compiler) await compiler.dispose();
-    fs.rmSync(temp,{force:true,recursive:true,maxRetries:3,retryDelay:100});
+    try {if (compiler) await compiler.dispose();}
+    finally {fs.rmSync(temp,{force:true,recursive:true,maxRetries:3,retryDelay:100});}
   }
 }
 async function main() {
