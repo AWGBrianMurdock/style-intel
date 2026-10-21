@@ -874,3 +874,125 @@ for(const factory of ['named','namespace']) test('R3: Node createRequire '+facto
   assert.equal(run.data.complete,false);
   assert.match(run.data.warnings.join('\n'),/Unsupported require/);
 });
+
+test('review R1: imported underscore Sass entries are compared and scripts are read once',t=>{
+  const root=fixture(t);
+  for (const [name,source] of [
+    ['static',"import './styles/_static';"],
+    ['dynamic',"export const theme=import('./styles/_dynamic.scss');"],
+    ['equals',"import theme = require('./styles/_equals.sass');"],
+  ]) put(root,`frontend/src/${name}.ts`,source);
+  for (const name of ['static','dynamic']) put(root,`frontend/src/styles/_${name}.scss`,'.warning{color:red}');
+  put(root,'frontend/src/styles/_equals.sass','.warning\n  color: red\n');
+  put(root,'shared/_outside.scss','.outside{color:red}');
+  put(root,'frontend/src/outside.ts','import "../../shared/_outside.scss";');
+  // Unimported partials must stay dependencies rather than automatic entries.
+  put(root,'frontend/src/styles/_unused.scss','@error "not an entry";');
+  git(root,['add','.']);git(root,['commit','-qm','Direct Sass entries']);
+  for (const name of ['static','dynamic']) put(root,`frontend/src/styles/_${name}.scss`,'.warning{color:blue}');
+  put(root,'frontend/src/styles/_equals.sass','.warning\n  color: blue\n');
+  const hook=`import fs from 'node:fs';const read=fs.readFileSync,counts=new Map();
+    fs.readFileSync=function(file,...rest){const name=String(file);if(/\\.(?:tsx?|jsx?)$/.test(name))counts.set(name,(counts.get(name)||0)+1);return read.call(this,file,...rest);};
+    process.on('exit',()=>{for(const [name,count]of counts)if(count>1)console.error('REPEATED_SCRIPT_READ '+name+' '+count);});`;
+  const run=execute('verify',args(root),{nodeArgs:['--import',`data:text/javascript,${encodeURIComponent(hook)}`]});
+  assert.equal(run.status,2,run.stderr||run.stdout);
+  assert.equal(run.data.summaryCounts.changed,3);
+  assert.equal(run.data.summaryCounts.compared,6);
+  assert.equal(run.data.complete,true);
+  assert.ok(run.data.comparisons.every(c=>c.entry.startsWith('frontend/')));
+  assert.ok(!run.data.comparisons.some(c=>c.entry.includes('_unused')));
+  assert.doesNotMatch(run.stderr,/REPEATED_SCRIPT_READ/);
+});
+
+test('review R2: extensionless TypeScript imports prefer ts to tsx for files and indexes',t=>{
+  const root=fixture(t);
+  for (const stem of ['Choice','folder/index']) {
+    put(root,`frontend/src/${stem}.ts`,"import './"+(stem.includes('/')?'../':'')+"styles/global.css'; export const choice=1;");
+    put(root,`frontend/src/${stem}.tsx`,"import './"+(stem.includes('/')?'../':'')+"components/Other.module.css'; export const choice=2;");
+  }
+  put(root,'frontend/src/ResolutionApp.tsx','import {choice} from "./Choice"; import "./folder";');
+  const actual=execute('impact',[...args(root),'--file','src/styles/global.css']);
+  assert.equal(actual.status,0,actual.stderr);
+  assert.ok(actual.data.affectedFiles.includes('frontend/src/ResolutionApp.tsx'));
+  const other=execute('impact',[...args(root),'--file','src/components/Other.module.css']);
+  assert.equal(other.status,0,other.stderr);
+  assert.ok(!other.data.affectedFiles.includes('frontend/src/ResolutionApp.tsx'));
+});
+
+test('review R3: import-equals bindings support CSS Module evidence, shadowing and reverse edges',t=>{
+  const root=fixture(t);
+  put(root,'frontend/src/components/CustomerCard.tsx',[
+    'import styles = require("./CustomerCard.module.css");',
+    'export const CustomerCard=()=> <div className={styles.warning}/>;',
+    'function shadow(styles){return styles.warning;}',
+  ].join('\n'));
+  put(root,'frontend/src/EqualsApp.tsx','import Card = require("./components/CustomerCard"); export const value=Card;');
+  const refs=execute('refs',[...args(root),'--selector','.warning','--file','src/components/CustomerCard.module.css']);
+  assert.equal(refs.status,0,refs.stderr);
+  assert.deepEqual(refs.data.references.map(r=>r.line),[2]);
+  const impact=execute('impact',[...args(root),'--file','src/components/CustomerCard.module.css']);
+  assert.equal(impact.status,0,impact.stderr);
+  assert.ok(impact.data.affectedFiles.includes('frontend/src/EqualsApp.tsx'));
+  put(root,'frontend/src/unresolved.ts','import missing = require("./missing.js");');
+  const incomplete=execute('impact',[...args(root),'--file','src/components/CustomerCard.module.css']);
+  assert.equal(incomplete.status,3,incomplete.stderr);
+  assert.match(incomplete.data.warnings.join('\n'),/Unresolved relative import.*missing.js/);
+});
+
+test('review R4: transparent CSS Module receiver wrappers preserve references and shadowing',t=>{
+  const root=fixture(t);
+  put(root,'frontend/src/components/CustomerCard.tsx',[
+    'import styles from "./CustomerCard.module.css";',
+    'export const CustomerCard=()=> <div className={(styles).warning}/>;',
+    'export const a=styles!.warning;',
+    'export const b=(styles as Record<string,string>).warning;',
+    'export const c=(styles satisfies Record<string,string>)["warning"];',
+    'function shadow(styles){return (styles as Record<string,string>).warning;}',
+  ].join('\n'));
+  const run=execute('refs',[...args(root),'--selector','.warning','--file','src/components/CustomerCard.module.css']);
+  assert.equal(run.status,0,run.stderr);
+  assert.deepEqual(run.data.references.map(r=>r.line),[2,3,4,5]);
+  const impact=execute('impact',[...args(root),'--selector','.warning','--file','src/components/CustomerCard.module.css']);
+  assert.equal(impact.status,0,impact.stderr);
+  assert.ok(impact.data.affectedFiles.includes('frontend/src/App.tsx'));
+});
+
+test('review R5: historical comparisons work after the current scope is removed or replaced',t=>{
+  const root=fixture(t);
+  fs.rmSync(path.join(root,'frontend'),{recursive:true});
+  git(root,['add','-A']);git(root,['commit','-qm','Remove frontend']);
+  for (const candidate of ['HEAD','worktree']) {
+    const run=execute('verify',[...args(root),'--baseline','HEAD~1','--candidate',candidate]);
+    assert.equal(run.status,2,run.stderr);
+    assert.equal(run.data.summaryCounts.changed,3);
+    assert.equal(run.data.complete,true);
+  }
+  put(root,'frontend','Scope replaced by a file');
+  const replaced=execute('verify',[...args(root),'--baseline','HEAD~1','--candidate','HEAD']);
+  assert.equal(replaced.status,2,replaced.stderr);
+  for (const command of ['inventory','refs','impact']) {
+    const run=execute(command,[...args(root),'--selector','.warning']);
+    assert.equal(run.status,3,run.stderr);
+    assert.match(run.stderr,/Scope directory not found/);
+  }
+});
+
+test('review performance: file-filter resolution and warning deduplication stay bounded',t=>{
+  const root=fixture(t);
+  for (let i=0;i<150;i++) put(root,`notes/${i}.txt`,'unrelated');
+  put(root,'frontend/src/missing.ts',Array.from({length:120},(_,i)=>`import "./missing-${i}";`).join('\n'));
+  const selected=path.join(root,'frontend/src/components/CustomerCard.module.css');
+  const hook=`import fs from 'node:fs';let paths=0,warningSearches=0;const lstat=fs.lstatSync,includes=Array.prototype.includes;
+    fs.lstatSync=function(p,...args){if(String(p)===${JSON.stringify(selected)})paths++;return lstat.call(this,p,...args);};
+    Array.prototype.includes=function(value,...args){if(typeof value==='string'&&value.startsWith('Unresolved relative import'))warningSearches+=this.length;return includes.call(this,value,...args);};
+    process.on('exit',()=>console.error('WORK='+JSON.stringify({paths,warningSearches})));`;
+  for (const command of ['refs','impact']) {
+    const run=execute(command,[...args(root),'--scope','.','--selector','.warning','--file','frontend/src/components/CustomerCard.module.css'],
+      {nodeArgs:['--import',`data:text/javascript,${encodeURIComponent(hook)}`]});
+    assert.equal(run.status,3,run.stderr);
+    assert.equal(run.data.totals.warnings,120);
+    const work=JSON.parse(run.stderr.match(/WORK=(.*)/)[1]);
+    assert.ok(work.paths<=2,`Repeated ${command} file path checks: ${work.paths}`);
+    assert.ok(work.warningSearches<=120,`Quadratic warning searches: ${work.warningSearches}`);
+  }
+});

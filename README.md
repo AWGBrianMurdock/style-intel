@@ -62,6 +62,8 @@ node .\style-intel.mjs compare --root $Repo --scope frontend --format json --lim
 
 By default, text output is brief. JSON limits selected evidence arrays to `--limit` (default **30**), reports full array counts under `totals`, and reports omitted items under `truncated`. Counts include all discovered evidence before formatting. Each CSS comparison includes `findingCount` and, when needed, `truncatedFindings`. Import-sequence evidence includes `beforeCount`/`afterCount` and `truncatedBefore`/`truncatedAfter`. Increase `--limit` when deeper evidence is needed. Write generated reports **outside** the target repository if you want to keep it untouched.
 
+`refs` and `impact` also report `staticResolution: "partial"` in JSON and `Static resolution: partial` in text. This describes the method's coverage independently of `complete`, which indicates whether the supported analysis finished without warnings. A successful command does not establish exhaustive application or runtime coverage.
+
 ## Commands
 
 | Command | What it does | What it does *not* prove |
@@ -84,7 +86,7 @@ A `--file` narrows definitions and the stylesheet identity of CSS Module referen
 
 Evidence confidence levels are `strong`, `probable`, and `possible`; unresolved dynamic class lookups are listed separately under `possibleDynamic`. HTML evidence comes from literal class attributes, including unquoted values, with comments and script/style/raw-text contents skipped. JSX module keys, unrelated attributes, and predicate strings are excluded from global-class evidence. Other exact JavaScript string literals may still be reported as `possible`, never proof of runtime class use. HTML entity decoding and full HTML error recovery are not implemented.
 
-Relative ES imports, re-exports, and string-literal `import()` calls are traversed. Resolution recognizes common emitted extensions (`.js` to `.ts`/`.tsx`, `.jsx` to `.tsx`, `.mjs` to `.mts`, `.cjs` to `.cts`), preferring an exact existing file, and includes `.mts`/`.cts` index files. Missing relative script/style imports, source parse errors, computed `import()` expressions, and unsupported `require()` calls produce warnings and `complete: false` (exit 3). Nonrelative packages and tsconfig aliases are not resolved. `complete` describes completion of the supported static analysis, not full application coverage; dynamic class expressions and runtime rendering remain unresolved.
+Relative ES imports, re-exports, TypeScript `import name = require("./module")` declarations, and string-literal `import()` calls are traversed. Resolution recognizes common emitted extensions (`.js` to `.ts`/`.tsx`, `.jsx` to `.tsx`, `.mjs` to `.mts`, `.cjs` to `.cts`), preferring an exact existing file, and includes `.mts`/`.cts` index files. Extensionless source and index lookup prefer `.ts` to `.tsx`; this fixed policy does not reproduce custom bundler resolution. CSS Module accesses retain their imported identity through parentheses, type assertions, non-null assertions, and `satisfies`, while respecting local shadowing. Missing relative script/style imports, source parse errors, computed `import()` expressions, and unsupported standalone `require()` calls produce warnings and `complete: false` (exit 3). Nonrelative packages and tsconfig aliases are not resolved. `complete` describes completion of the supported static analysis, not full application coverage; dynamic class expressions and runtime rendering remain unresolved.
 
 Parsing SCSS works on the original syntax using `postcss-scss`. It does **not** fully expand selectors created through nesting, mixins, interpolation, or dynamic runtime composition. Indented `.sass` is supported for compilation in `compare` but is **not** mapped by `refs` in this release. CSS Module compositions, `:global`, TS path aliases and JS computed strings also have incomplete coverage. Never automatically delete styles based on zero references.
 
@@ -111,6 +113,8 @@ node .\style-intel.mjs compare --root $Repo --scope frontend `
 ```
 
 `--baseline` and `--candidate` accept `worktree`, an immutable Git commit or ref, or a directory containing a mirror of the original repository tree. For Git refs, the tool resolves the commit, streams blobs using `git cat-file --batch`, writes CSS/SCSS and scoped JS/TS files into a **unique OS temporary directory**, and deletes that directory at the end. It does **not** change branches, stash, checkout, or reset Git files.
+
+Comparison scopes may be absent from the current worktree if a requested snapshot contains them. Automatic entry discovery includes non-partial stylesheets plus underscore-prefixed Sass files directly imported by scoped JS/TS through static imports, re-exports, import-equals declarations, or literal `import()` calls. Unimported Sass partials remain dependencies; use `--entry` to select one explicitly. Entry discovery and import-order analysis share one script read per file per side and retain only compact import data.
 
 The comparison is order-sensitive and intentionally conservative. Treat its results as static evidence: Sass is compiled entry by entry, and the application build pipeline and browser behavior are not reproduced.
 

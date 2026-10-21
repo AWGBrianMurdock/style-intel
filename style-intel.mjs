@@ -54,7 +54,13 @@ function asRepoPath(root, scope, input) {
   const found=possible.find(p=>fs.existsSync(p));
   return relative(root, found || possible[possible.length-1]);
 }
-function pushUnique(arr, val) { if (!arr.includes(val)) arr.push(val); }
+// These append-only evidence arrays retain their output order without repeated scans.
+const uniqueValues = new WeakMap();
+function pushUnique(arr, val) {
+  let seen=uniqueValues.get(arr);
+  if (!seen) {seen=new Set(arr);uniqueValues.set(arr,seen);}
+  if (!seen.has(val)) {seen.add(val);arr.push(val);}
+}
 function required(id, hint) {
   try { return require(id); } catch (error) {
     throw new Error(`${id} is required for this command. Run npm install in the style-intel directory. ${hint || ''}`.trim(), {cause:error});
@@ -133,7 +139,9 @@ function parseArgs(argv) {
   opts.root = path.resolve(opts.root);
   if (!fs.statSync(opts.root, {throwIfNoEntry:false})?.isDirectory()) throw new Error(`Root directory not found: ${opts.root}`);
   opts.scopeAbs = ensureUnder(opts.root, path.resolve(opts.root, opts.scope));
-  if (!fs.statSync(opts.scopeAbs, {throwIfNoEntry:false})?.isDirectory()) throw new Error(`Scope directory not found: ${opts.scopeAbs}`);
+  // Historical/directory sides can contain a scope deleted from the worktree.
+  if (!['compare','verify'].includes(command) && !fs.statSync(opts.scopeAbs, {throwIfNoEntry:false})?.isDirectory())
+    throw new Error(`Scope directory not found: ${opts.scopeAbs}`);
   opts.scope = relative(opts.root, opts.scopeAbs) || '.';
   return opts;
 }
@@ -197,6 +205,7 @@ function display(result, opts) {
   const prefix = `${result.command}: ${result.summary || ''}`;
   console.log(prefix);
   if (result.scope) console.log(`Scope: ${result.scope}`);
+  if (result.staticResolution) console.log(`Static resolution: ${result.staticResolution}`);
   if (result.projects) {
     for (const p of result.projects.slice(0, opts.limit)) console.log(`  ${p.kind.padEnd(16)} ${p.path}`);
     console.log(`Source: ${JSON.stringify(result.counts)}`);
@@ -314,10 +323,16 @@ function moduleCandidates(spec, importer, known) {
   const emitted = {'.js':['.ts','.tsx'],'.jsx':['.tsx'],'.mjs':['.mts'],'.cjs':['.cts']};
   const ext = path.posix.extname(stem);
   const attempts = [stem, ...(emitted[ext]||[]).map(x=>stem.slice(0,-ext.length)+x),
-    ...['.tsx','.ts','.jsx','.js','.mts','.cts','.mjs','.cjs','.css','.scss','.sass'].map(x=>stem+x),
-    ...['index.tsx','index.ts','index.jsx','index.js','index.mts','index.cts','index.mjs','index.cjs','index.css','index.scss','index.sass'].map(x=>stem+'/'+x)];
+    ...['.ts','.tsx','.jsx','.js','.mts','.cts','.mjs','.cjs','.css','.scss','.sass'].map(x=>stem+x),
+    ...['index.ts','index.tsx','index.jsx','index.js','index.mts','index.cts','index.mjs','index.cjs','index.css','index.scss','index.sass'].map(x=>stem+'/'+x)];
   const found = attempts.find(x=>known.has(x));
   return found ? [found] : [];
+}
+function staticModuleSpecifier(statement) {
+  const t=ts();
+  if (t.isImportEqualsDeclaration(statement) && t.isExternalModuleReference(statement.moduleReference))
+    return statement.moduleReference.expression;
+  if (t.isImportDeclaration(statement) || t.isExportDeclaration(statement)) return statement.moduleSpecifier;
 }
 function warnUnresolved(imports, file, warnings) {
   for (const {spec,targets,unsupported} of imports) {
@@ -334,8 +349,9 @@ function importBindings(sf, importer, known) {
   let checker;
   const getChecker=()=>checker??=bindingChecker(sf);
   for (const statement of sf.statements) {
-    if ((t.isImportDeclaration(statement) || t.isExportDeclaration(statement)) && statement.moduleSpecifier && t.isStringLiteral(statement.moduleSpecifier)) {
-      const spec = statement.moduleSpecifier.text;
+    const specifier=staticModuleSpecifier(statement);
+    if (specifier && t.isStringLiteral(specifier)) {
+      const spec = specifier.text;
       const targets = moduleCandidates(spec,importer,known);
       imports.push({spec,targets});
       // A static CSS Module access is evidence even if the stylesheet is missing.
@@ -348,6 +364,7 @@ function importBindings(sf, importer, known) {
         if (clause.namedBindings && t.isNamespaceImport(clause.namedBindings))
           bindings.set(clause.namedBindings.name.text,bindingTarget);
       }
+      if (t.isImportEqualsDeclaration(statement) && bindingTarget) bindings.set(statement.name.text,bindingTarget);
     }
   }
   function isNodeRequireFactory(expression) {
@@ -427,13 +444,12 @@ function htmlClasses(source) {
   }
   return found;
 }
-function gatherReferences(opts, queryName, definitions, files, warnings, scriptImports) {
+function gatherReferences(opts, queryName, definitions, files, warnings, scriptImports, selected=null) {
   const sourceFiles = files.filter(f => SCRIPT_EXT.test(f) || /\.html?$/i.test(f));
   const known = new Set(files);
   const refs=[], dynamic=[], seen = new Set();
   const moduleDefs = new Set(definitions.filter(d=>d.module).map(d=>d.file));
   const anyGlobal = definitions.some(d=>!d.module);
-  const selected=opts.file ? asRepoPath(opts.root,opts.scopeAbs,opts.file) : null;
   const moduleAllowed=f=>/\.module\.(?:css|scss|sass)$/i.test(f) && (!selected || f===selected);
   const t = ts();
   for (const file of sourceFiles) {
@@ -456,10 +472,16 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
     scriptImports?.set(file,{imports});
     warnUnresolved(imports,file,warnings);
     const checker=[...bindings.values()].some(f=>/\.module\.(?:css|scss|sass)$/i.test(f))?getChecker():null;
-    function importedSource(identifier) {
+    function importedSource(expression) {
+      // These TypeScript/JavaScript wrappers preserve the underlying binding.
+      let identifier=expression;
+      while (t.isParenthesizedExpression(identifier) || t.isAsExpression(identifier) ||
+        t.isTypeAssertionExpression(identifier) || t.isNonNullExpression(identifier) || t.isSatisfiesExpression(identifier))
+        identifier=identifier.expression;
+      if (!t.isIdentifier(identifier)) return undefined;
       if (!checker || !bindings.has(identifier.text)) return undefined;
       const symbol=checker.getSymbolAtLocation(identifier);
-      return symbol?.declarations?.some(d=>(t.isImportClause(d)||t.isNamespaceImport(d)) && d.getSourceFile()===sf)
+      return symbol?.declarations?.some(d=>(t.isImportClause(d)||t.isNamespaceImport(d)||t.isImportEqualsDeclaration(d)) && d.getSourceFile()===sf)
         ? bindings.get(identifier.text) : undefined;
     }
     const line = node => sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1;
@@ -469,26 +491,26 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
       // Comments are not AST literals. Exclude module names, property keys,
       // element indices and JSX attributes from speculative string evidence.
       for (let p=node.parent;p;p=p.parent) {
-        if (t.isJsxAttribute(p) || t.isImportDeclaration(p) || t.isExportDeclaration(p)) return false;
+        if (t.isJsxAttribute(p) || t.isImportDeclaration(p) || t.isExportDeclaration(p) || t.isImportEqualsDeclaration(p)) return false;
       }
       const p=node.parent;
       return !(t.isElementAccessExpression(p) && p.argumentExpression===node) &&
         !((t.isPropertyAssignment(p)||t.isMethodDeclaration(p)) && p.name===node);
     }
     function walk(node, inClassExpr=false) {
-      if (t.isPropertyAccessExpression(node) && t.isIdentifier(node.expression)) {
+      if (t.isPropertyAccessExpression(node)) {
         const source = importedSource(node.expression);
         if (source && moduleAllowed(source) && node.name.text === queryName)
           addRef(refs,{file,line:line(node),kind:'css-module-property',confidence:'strong',...moduleEvidence(source),
-            detail:node.expression.text+'.'+queryName},seen);
+            detail:node.expression.getText(sf)+'.'+queryName},seen);
       }
-      if (t.isElementAccessExpression(node) && t.isIdentifier(node.expression)) {
+      if (t.isElementAccessExpression(node)) {
         const source = importedSource(node.expression);
         if (source && /\.module\.(?:css|scss|sass)$/i.test(source)) {
           if (moduleAllowed(source)) {
             if (node.argumentExpression && t.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === queryName)
               addRef(refs,{file,line:line(node),kind:'css-module-element',confidence:'strong',...moduleEvidence(source),
-                detail:node.expression.text+'['+JSON.stringify(queryName)+']'},seen);
+                detail:node.expression.getText(sf)+'['+JSON.stringify(queryName)+']'},seen);
             else if (!node.argumentExpression || !t.isStringLiteralLike(node.argumentExpression))
               dynamic.push({file,line:line(node),kind:'dynamic-css-module-index',...moduleEvidence(source)});
           }
@@ -570,18 +592,18 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
   refs.sort((a,b)=>confidenceRank[a.confidence]-confidenceRank[b.confidence] || a.file.localeCompare(b.file)||a.line-b.line||a.kind.localeCompare(b.kind));
   return {refs,dynamic:dynamic.filter(d=>d.definition ? moduleAllowed(d.definition) : anyGlobal)};
 }
-function refsCommand(opts, filesArg, scriptImports) {
+function refsCommand(opts, filesArg, scriptImports, selected=opts.file ? asRepoPath(opts.root,opts.scopeAbs,opts.file) : null) {
   if (!opts.selector) throw new Error('refs requires --selector .class-name');
   const name = opts.selector.replace(/^\./,'');
   if (!name || /[\s#\[:>,]/.test(name)) throw new Error('--selector must be one class name (e.g., .customer-card)');
   const files = filesArg || walkFiles(opts.root,opts.scopeAbs);
   const warnings=[];
-  const cssFiles = opts.file ? files.filter(f=>f===asRepoPath(opts.root,opts.scopeAbs,opts.file)) : files;
+  const cssFiles = selected===null ? files : files.filter(f=>f===selected);
   const definitions=styleDefinitions(opts,name,cssFiles,warnings);
-  const {refs,dynamic}=gatherReferences(opts,name,definitions,files,warnings,scriptImports);
+  const {refs,dynamic}=gatherReferences(opts,name,definitions,files,warnings,scriptImports,selected);
   return {tool:'style-intel',version:VERSION,command:'refs',scope:opts.scope,selector:'.'+name,
     summary:`${definitions.length} selector definitions and ${refs.length} candidate references`,
-    definitions,references:refs,possibleDynamic:dynamic,complete:warnings.length===0,
+    definitions,references:refs,possibleDynamic:dynamic,complete:warnings.length===0,staticResolution:'partial',
     warnings,limitations:['Class references are static evidence, not DOM/runtime coverage',
       'SCSS interpolation/nesting and TS aliases may evade resolution',
       'No references found never proves a selector is unused']};
@@ -610,14 +632,15 @@ function buildGraph(opts,files,warnings,scriptImports) {
 function impactCommand(opts) {
   if (!opts.file && !opts.selector) throw new Error('impact requires --file PATH or --selector .class');
   const files=walkFiles(opts.root,opts.scopeAbs), warnings=[];
+  const selected=opts.file ? asRepoPath(opts.root,opts.scopeAbs,opts.file) : null;
   const scriptImports=opts.selector?new Map():undefined;
   let starting=[];
   let refsReport=null;
   if (opts.selector) {
-    refsReport=refsCommand(opts,files,scriptImports);
+    refsReport=refsCommand(opts,files,scriptImports,selected);
     starting=[...new Set(refsReport.references.filter(r=>['strong','probable'].includes(r.confidence)).map(r=>r.file))];
   } else {
-    starting=[asRepoPath(opts.root,opts.scopeAbs,opts.file)];
+    starting=[selected];
     if (!files.includes(starting[0])) throw new Error(`Source file is not in the selected scope: ${starting[0]}`);
   }
   const reverse=buildGraph(opts,files,warnings,scriptImports);
@@ -631,12 +654,12 @@ function impactCommand(opts) {
   }
   const affected=sort(seen);
   return {tool:'style-intel',version:VERSION,command:'impact',scope:opts.scope,
-    input:opts.selector ? {selector:opts.selector,...(opts.file ? {file:asRepoPath(opts.root,opts.scopeAbs,opts.file)} : {})} : {file:starting[0]},
+    input:opts.selector ? {selector:opts.selector,...(selected===null ? {} : {file:selected})} : {file:starting[0]},
     summary:`${starting.length} seeds, ${direct.size} direct importers, ${affected.length} potentially related files`,
     directConsumers:sort(direct),affectedFiles:affected,
     possibleRoutes:affected.filter(x=>/(?:^|\/)(?:pages?|routes?|views?)\/|(?:^|\/)App\.[tj]sx?$/i.test(x)),
     selectorEvidence:refsReport?{definitions:refsReport.definitions.length,references:refsReport.references.length}:undefined,
-    complete: warnings.length===0 && (!refsReport || refsReport.complete), warnings,limitations:['Relative ES imports, re-exports and static import() calls are traversed; tsconfig aliases, require() calls, computed imports and runtime routes may be missed',
+    complete: warnings.length===0 && (!refsReport || refsReport.complete),staticResolution:'partial',warnings,limitations:['Relative ES imports, re-exports, import-equals and static import() calls are traversed; tsconfig aliases, require() calls, computed imports and runtime routes may be missed',
       'Import reachability is not evidence a component renders or a CSS rule applies']};
 }
 function git(root,args, options={}) {
@@ -693,7 +716,9 @@ function trackedSymlinks(root) {
 function filesystemSide(opts,root,kind) {
   const links=trackedSymlinks(root);
   const eligible=file=>eligibleFile(file) && !links.has(process.platform==='win32'?file.toLowerCase():file);
-  const files=walkFiles(root,path.join(root,opts.scope)).filter(f=>eligible(f)&&(STYLE_EXT.test(f)||SCRIPT_EXT.test(f)));
+  const scope=ensureUnder(root,path.join(root,opts.scope));
+  const files=(fs.statSync(scope,{throwIfNoEntry:false})?.isDirectory() ? walkFiles(root,scope) : [])
+    .filter(f=>eligible(f)&&(STYLE_EXT.test(f)||SCRIPT_EXT.test(f)));
   // Explicit entries may live outside scope. Sass reads other dependencies
   // directly from this side, so discovery need not traverse the whole tree.
   for (const entry of opts.entries) {
@@ -721,6 +746,7 @@ async function prepareSide(opts, spec, tempParent) {
     : fs.statSync(directory,{throwIfNoEntry:false})?.isDirectory() ? filesystemSide(opts,directory,'directory')
     : await snapshotRevision(opts,spec,tempParent);
   side.fileSet=new Set(side.files);
+  side.scriptImports=new Map();
   return side;
 }
 function asEntryList(opts,a,b) {
@@ -739,6 +765,14 @@ function asEntryList(opts,a,b) {
     if (a.fileSet.has(scopeCandidate) || b.fileSet.has(scopeCandidate)) return scopeCandidate;
     throw new Error(`--entry not found in either snapshot: ${f}`);
   }));
+  // Underscores denote Sass dependencies by convention, but JS can import one
+  // as a standalone entry. Reuse the same compact import scan for order checks.
+  for (const side of [a,b]) for (const file of side.files) {
+    if (!SCRIPT_EXT.test(file) || !inScope(file)) continue;
+    for (const spec of directImports(side,file).styles) {
+      for (const target of moduleCandidates(spec,file,side.fileSet)) if (STYLE_EXT.test(target) && inScope(target)) all.add(target);
+    }
+  }
   return sort(all);
 }
 function canonicalCss(source, label) {
@@ -805,11 +839,28 @@ function summarizeDifference(before,after) {
   return {reorderedOnly:sameMultiset,findings};
 }
 function directImports(side,file) {
-  if (!side.fileSet.has(file)) return [];
+  if (!side.fileSet.has(file)) return {sequence:[],styles:[]};
+  if (side.scriptImports.has(file)) return side.scriptImports.get(file);
   const sf=sourceFile(file,path.join(side.path,file));
-  return sf.statements
-    .filter(x=>ts().isImportDeclaration(x) && x.moduleSpecifier && ts().isStringLiteral(x.moduleSpecifier))
-    .map(x=>x.moduleSpecifier.text);
+  const sequence=[], styles=[];
+  const t=ts();
+  for (const statement of sf.statements) {
+    const specifier=staticModuleSpecifier(statement);
+    if (!specifier || !t.isStringLiteral(specifier)) continue;
+    if (t.isImportDeclaration(statement) || t.isImportEqualsDeclaration(statement)) sequence.push(specifier.text);
+    if (STYLE_EXT.test(specifier.text) || !path.posix.extname(specifier.text)) styles.push(specifier.text);
+  }
+  function dynamicStyles(node) {
+    if (t.isCallExpression(node) && node.expression.kind===t.SyntaxKind.ImportKeyword) {
+      const arg=node.arguments[0];
+      if (arg && t.isStringLiteralLike(arg) && (STYLE_EXT.test(arg.text) || !path.posix.extname(arg.text))) styles.push(arg.text);
+    }
+    t.forEachChild(node,dynamicStyles);
+  }
+  dynamicStyles(sf);
+  const result={sequence,styles};
+  side.scriptImports.set(file,result); // Retain strings, never repository-wide ASTs.
+  return result;
 }
 function compareStyleImportOrder(opts,baseline,candidate) {
   // React bundlers may have observable order-dependent CSS imports. An identical
@@ -820,8 +871,8 @@ function compareStyleImportOrder(opts,baseline,candidate) {
   for (const file of all) {
     let before,after;
     try {
-      before=directImports(baseline,file);
-      after=directImports(candidate,file);
+      before=directImports(baseline,file).sequence;
+      after=directImports(candidate,file).sequence;
     } catch(e) {
       throw new Error(`Cannot inspect frontend source imports in ${file}: ${e.message}`);
     }
@@ -871,10 +922,10 @@ async function compareCommand(opts, verify=false) {
         // Absolute imports and external junctions must not bypass snapshot
         // isolation. Inspect actual loaded files, not just configured load paths.
         if (path.relative(opts.root,side.path)!=='') {
-          const project=fs.realpathSync(opts.root), snapshot=fs.realpathSync(side.path);
+          const project=fs.realpathSync.native(opts.root), snapshot=fs.realpathSync.native(side.path);
           for (const url of result.loadedUrls||[]) {
             if (url.protocol!=='file:') continue;
-            const loaded=fs.realpathSync(fileURLToPath(url));
+            const loaded=fs.realpathSync.native(fileURLToPath(url));
             const fromSnapshot=path.relative(snapshot,loaded), fromProject=path.relative(project,loaded);
             const inside=p=>p!=='..' && !p.startsWith('..'+path.sep) && !path.isAbsolute(p);
             if (!inside(fromSnapshot) && inside(fromProject) && !fromProject.split(path.sep).includes('node_modules'))
