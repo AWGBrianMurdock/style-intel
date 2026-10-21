@@ -22,7 +22,7 @@ function put(root,file,text) {
   fs.mkdirSync(path.dirname(abs),{recursive:true});
   fs.writeFileSync(abs,text,'utf8');
 }
-function fixture(t) {
+function sourceFixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'style intel fixture '));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true,maxRetries:2}));
   put(root,'frontend/package.json',JSON.stringify({name:'frontend',dependencies:{react:'^19.0.0'}}));
@@ -49,6 +49,10 @@ export default function App(){return <Dashboard/>;}
 `);
   put(root,'frontend/src/pages/Unrelated.tsx','export function Unrelated(){return null;}');
   put(root,'frontend/src/views/status.html','<div class="customer-card warning">Hi</div>');
+  return root;
+}
+function gitFixture(t) {
+  const root=sourceFixture(t);
   git(root,['init','-q']);
   git(root,['config','user.name','Test']);
   git(root,['config','user.email','test@example.invalid']);
@@ -59,7 +63,7 @@ export default function App(){return <Dashboard/>;}
 const args = root => ['--root',root,'--scope','frontend','--format','json'];
 
 test('inventory detects React and Java manifests in a path containing spaces',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   const run=execute('inventory',['--root',root,'--format','json']);
   assert.equal(run.status,0,run.stderr);
   assert.ok(run.data.projects.some(x=>x.kind==='react-frontend'));
@@ -67,16 +71,8 @@ test('inventory detects React and Java manifests in a path containing spaces',t=
   assert.equal(run.data.counts.css,3);
 });
 
-test('refs maps CSS module property usages to the correct imported module',t=>{
-  const root=fixture(t);
-  const run=execute('refs',[...args(root),'--selector','.root']);
-  assert.equal(run.status,0,run.stderr);
-  assert.equal(run.data.definitions.length,1);
-  assert.ok(run.data.references.some(x=>x.kind==='css-module-property'&&x.definition.endsWith('CustomerCard.module.css')));
-});
-
 test('refs distinguishes separate CSS modules and flags unknown usage rather than declaring unused',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   const run=execute('refs',[...args(root),'--selector','.warning','--file','src/components/Other.module.css']);
   assert.equal(run.status,0,run.stderr);
   assert.equal(run.data.definitions.length,1);
@@ -84,25 +80,8 @@ test('refs distinguishes separate CSS modules and flags unknown usage rather tha
   assert.ok(run.data.limitations.some(x=>x.includes('never proves')));
 });
 
-test('refs sees JSX global selectors and HTML consumers',t=>{
-  const root=fixture(t);
-  const run=execute('refs',[...args(root),'--selector','.customer-card']);
-  assert.equal(run.status,0,run.stderr);
-  assert.ok(run.data.references.some(x=>x.kind==='html-class'));
-  assert.ok(run.data.references.some(x=>x.kind==='jsx-class-expression'));
-});
-
-test('impact walks module consumers to pages and App but not unrelated files',t=>{
-  const root=fixture(t);
-  const run=execute('impact',[...args(root),'--file','src/components/CustomerCard.module.css']);
-  assert.equal(run.status,0,run.stderr);
-  assert.ok(run.data.affectedFiles.some(f=>f.endsWith('pages/Dashboard.tsx')));
-  assert.ok(run.data.affectedFiles.some(f=>f.endsWith('/App.tsx')));
-  assert.ok(!run.data.affectedFiles.some(f=>f.includes('Unrelated.tsx')));
-});
-
 for (const selector of ['.root','.customer-card','.warning']) test(`impact ${selector} reads each script once per command`,t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   const broken=selector==='.warning';
   if (broken) put(root,'frontend/src/broken.ts','const x = ;');
   const countsFile=path.join(root,'script-reads.json');
@@ -138,7 +117,7 @@ process.on('exit',()=>fs.writeFileSync(${JSON.stringify(countsFile)},JSON.string
 });
 
 test('compare reports static equality at HEAD and ignores whitespace/comments',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/global.css','/* A comment */\n.customer-card{color:red}\n.warning {color:orange}\n');
   const run=execute('compare',[...args(root)]);
   assert.equal(run.status,0,run.stderr);
@@ -149,7 +128,7 @@ test('compare reports static equality at HEAD and ignores whitespace/comments',t
 });
 
 test('verify reports property differences and exits 2',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/global.css','.customer-card { color: blue; }\n.warning { color: orange; }\n');
   const run=execute('verify',[...args(root)]);
   assert.equal(run.status,2,run.stderr);
@@ -158,7 +137,7 @@ test('verify reports property differences and exits 2',t=>{
 });
 
 test('compare recognizes rule-order changes as cascade-sensitive',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/global.css','.warning { color: orange; }\n.customer-card { color: red; }\n');
   const run=execute('compare',[...args(root)]);
   assert.equal(run.status,0,run.stderr);
@@ -166,7 +145,7 @@ test('compare recognizes rule-order changes as cascade-sensitive',t=>{
 });
 
 test('verify handles removed stylesheets and shows correct status',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   fs.rmSync(path.join(root,'frontend/src/styles/global.css'));
   const run=execute('verify',[...args(root)]);
   assert.equal(run.status,2,run.stderr);
@@ -174,22 +153,29 @@ test('verify handles removed stylesheets and shows correct status',t=>{
 });
 
 test('rejects paths outside repository',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   const run=execute('impact',[...args(root),'--file','../../../../elsewhere.tsx']);
   assert.equal(run.status,3);
   assert.match(run.stderr,/outside --root/i);
 });
 
-test('provides actionable Sass missing dependency diagnostics when dependency is not installed',t=>{
-  const root=fixture(t);
+test('missing Sass compilers produce actionable dependency diagnostics',t=>{
+  const root=sourceFixture(t);
   put(root,'frontend/src/styles/new.scss','a{color:red}');
-  const run=execute('compare',[...args(root)]);
-  if (run.status===3) assert.match(run.stderr,/sass|install/i);
-  else assert.equal(run.status,0,run.stderr); // environment has Sass installed
+  const hook=path.join(root,'missing-sass.cjs');
+  put(root,'missing-sass.cjs',`const Module=require('node:module'),load=Module._load;
+    Module._load=function(id,...args){
+      if(id==='sass-embedded'||id==='sass')throw new Error('synthetic unavailable compiler');
+      return load.call(this,id,...args);
+    };`);
+  const run=execute('compare',[...args(root),'--baseline','worktree'],{nodeArgs:['--require',hook]});
+  assert.equal(run.status,3,run.stderr||run.stdout);
+  assert.match(run.stderr,/sass is required.*Run npm install/);
+  assert.match(run.stderr,/Install sass-embedded \(preferred\) or sass/);
 });
 
 test('verify flags CSS import-order changes even when stylesheet contents are identical',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/first.css','.first{color:red}');
   put(root,'frontend/src/second.css','.second{color:blue}');
   put(root,'frontend/src/main.tsx',`import './first.css';\nimport './second.css';\n`);
@@ -203,7 +189,7 @@ test('verify flags CSS import-order changes even when stylesheet contents are id
 });
 
 test('refs reports unresolved CSS module property expressions',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx',`
 import styles from './CustomerCard.module.css';
 const state='warning';
@@ -217,7 +203,7 @@ export function CustomerCard(){return <div className={styles[state]}/>}
 });
 
 test('compare accepts a separately captured directory snapshot as baseline',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const backup=fs.mkdtempSync(path.join(os.tmpdir(),'style intel baseline '));
   t.after(()=>fs.rmSync(backup,{recursive:true,force:true,maxRetries:2}));
   fs.cpSync(path.join(root,'frontend'),path.join(backup,'frontend'),{recursive:true});
@@ -228,16 +214,8 @@ test('compare accepts a separately captured directory snapshot as baseline',t=>{
   assert.equal(run.data.summaryCounts.changed,1);
 });
 
-test('JSON response limits large evidence arrays and reports truncation',t=>{
-  const root=fixture(t);
-  const run=execute('inventory',['--root',root,'--format','json','--limit','1']);
-  assert.equal(run.status,0,run.stderr);
-  assert.equal(run.data.projects.length,1);
-  assert.ok(run.data.truncated.projects>=1);
-});
-
 test('compare --entry only evaluates chosen stylesheet',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/global.css','.changed{color:red}');
   const run=execute('verify',[...args(root),'--entry','src/components/CustomerCard.module.css']);
   assert.equal(run.status,0,run.stderr);
@@ -245,7 +223,7 @@ test('compare --entry only evaluates chosen stylesheet',t=>{
 });
 
 for (const absolute of [false,true]) test(`F1: ${absolute?'absolute':'relative'} project load paths isolate Sass snapshots`,t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/shared/_tokens.scss','$color: red;');
   put(root,'frontend/src/styles/main.scss','@use "tokens"; .sample {color: tokens.$color}');
   git(root,['add','.']);git(root,['commit','-qm','Add Sass entry']);
@@ -257,7 +235,7 @@ for (const absolute of [false,true]) test(`F1: ${absolute?'absolute':'relative'}
 });
 
 test('F1: relative load paths cannot fill missing historical project imports from worktree',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/main.scss','@use "newtokens"; .sample {color: newtokens.$color}');
   git(root,['add','.']);git(root,['commit','-qm','Commit unresolved historical import']);
   put(root,'frontend/shared/_newtokens.scss','$color: blue;');
@@ -268,9 +246,9 @@ test('F1: relative load paths cannot fill missing historical project imports fro
 });
 
 test('F2: automatically compares underscore-prefixed plain CSS',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/_theme.css','.theme{color:red}');
-  put(root,'frontend/src/theme.ts',"import './styles/_theme.css';");
+  // No JS import: automatic discovery must include plain CSS even with '_'.
   git(root,['add','.']);git(root,['commit','-qm','Add CSS entry']);
   put(root,'frontend/src/styles/_theme.css','.theme{color:blue}');
   const run=execute('verify',args(root));
@@ -279,7 +257,7 @@ test('F2: automatically compares underscore-prefixed plain CSS',t=>{
 });
 
 test('F3: tracked generated styles are ignored on both sides',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/dist/app.css','.generated{color:red}');
   git(root,['add','-f','frontend/dist/app.css']);git(root,['commit','-qm','Track generated CSS']);
   const run=execute('verify',args(root));
@@ -288,7 +266,7 @@ test('F3: tracked generated styles are ignored on both sides',t=>{
 });
 
 test('F3: Git symlink blobs are excluded rather than reconstructed as CSS',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const blob=spawnSync('git',['-C',root,'hash-object','-w','--stdin'],{
     input:'src/styles/global.css',encoding:'utf8',windowsHide:true});
   assert.equal(blob.status,0,blob.stderr);
@@ -300,7 +278,7 @@ test('F3: Git symlink blobs are excluded rather than reconstructed as CSS',t=>{
 });
 
 test('F4: scoped comparisons do not traverse unrelated directories',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const hook=`import fs from 'node:fs'; import path from 'node:path';
     const original=fs.readdirSync;
     fs.readdirSync=function(dir,...rest){
@@ -314,7 +292,7 @@ test('F4: scoped comparisons do not traverse unrelated directories',t=>{
 });
 
 test('F5: CSS module references respect parameter, block, and function hoisting shadows',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx',`
     import styles from './CustomerCard.module.css';
     function parameter(styles){return <div className={styles.warning}/>;}
@@ -329,7 +307,7 @@ test('F5: CSS module references respect parameter, block, and function hoisting 
 });
 
 test('F6: rejects a scope junction or symlink outside root, including nested scopes',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const outside=fs.mkdtempSync(path.join(os.tmpdir(),'style intel external '));
   t.after(()=>fs.rmSync(outside,{recursive:true,force:true,maxRetries:2}));
   put(outside,'nested/outside.css','.outside{color:red}');
@@ -354,7 +332,7 @@ test('F6: rejects a scope junction or symlink outside root, including nested sco
 });
 
 for (const command of ['refs','impact','verify']) test(`F7: ${command} rejects incomplete JS/TS parsing`,t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/broken.ts','const x = ;');
   const extra=command==='refs'?['--selector','.warning']:
     command==='impact'?['--file','src/styles/global.css']:[];
@@ -365,14 +343,14 @@ for (const command of ['refs','impact','verify']) test(`F7: ${command} rejects i
 });
 
 test('F8: absolute entries missing from both sides are invalid arguments',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const run=execute('verify',[...args(root),'--entry',path.join(root,'frontend/missing.css')]);
   assert.equal(run.status,3,run.stderr);
   assert.match(run.stderr,/not found in either snapshot/i);
 });
 
 for (const loadPath of ['external','node_modules']) test(`F1: preserves shared ${loadPath} Sass dependencies`,t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const external=fs.mkdtempSync(path.join(os.tmpdir(),'style intel Sass dependency '));
   t.after(()=>fs.rmSync(external,{recursive:true,force:true,maxRetries:2}));
   const dependency=loadPath==='external'?external:path.join(root,'frontend/node_modules/theme');
@@ -385,7 +363,7 @@ for (const loadPath of ['external','node_modules']) test(`F1: preserves shared $
 });
 
 test('F4: scoped Sass entries can use checked-in dependencies outside scope',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'shared/_tokens.scss','$color: red;');
   put(root,'frontend/src/styles/main.scss','@use "tokens"; .sample{color:tokens.$color}');
   git(root,['add','.']);git(root,['commit','-qm','Add out of scope Sass dependency']);
@@ -396,7 +374,7 @@ test('F4: scoped Sass entries can use checked-in dependencies outside scope',t=>
 });
 
 test('F8: absolute entries present on only one side retain addition and removal reports',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   const removed=path.join(root,'frontend/src/styles/global.css');
   fs.unlinkSync(removed);
   put(root,'frontend/added.css','.added{color:blue}');
@@ -409,7 +387,7 @@ test('F8: absolute entries present on only one side retain addition and removal 
 
 
 test('F4: scope-relative explicit entries may point to a sibling within root',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'shared/entry.css','.shared{color:red}');
   git(root,['add','.']);git(root,['commit','-qm','Add sibling CSS entry']);
   const run=execute('verify',[...args(root),'--entry','../shared/entry.css']);
@@ -419,7 +397,7 @@ test('F4: scope-relative explicit entries may point to a sibling within root',t=
 });
 
 test('R1: ignored tracked Sass remains available as a snapshot dependency',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/vendor/_tokens.scss','$color: red;');
   put(root,'frontend/src/main.scss','@use "../vendor/tokens"; .sample{color:tokens.$color}');
   git(root,['add','-f','frontend/vendor/_tokens.scss','frontend/src/main.scss']);
@@ -435,7 +413,7 @@ test('R1: ignored tracked Sass remains available as a snapshot dependency',t=>{
 });
 
 test('R2: excludes materialized Git symlink placeholders from worktree comparisons',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   git(root,['config','core.symlinks','false']);
   const blob=spawnSync('git',['-C',root,'hash-object','-w','--stdin'],{
     input:'src/styles/global.css',encoding:'utf8',windowsHide:true});
@@ -465,7 +443,7 @@ test('R2: directory-only comparisons work without Git metadata',t=>{
 
 
 for (const missingSheet of [false,true]) test('CSS Module usages survive missing '+(missingSheet?'stylesheet':'selector definitions'),t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   const sheet=missingSheet?'Gone.module.css':'CustomerCard.module.css';
   put(root,'frontend/src/components/CustomerCard.tsx',[
     'import styles from "./'+sheet+'";',
@@ -494,7 +472,7 @@ for (const missingSheet of [false,true]) test('CSS Module usages survive missing
 });
 
 test('CSS Module references report matched definitions separately',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx','import s from "./CustomerCard.module.css";\nexport const a=s.absent;\nexport const b=s.warning;');
   const missing=execute('refs',[...args(root),'--selector','.absent']);
   assert.equal(missing.status,0,missing.stderr);
@@ -502,11 +480,14 @@ test('CSS Module references report matched definitions separately',t=>{
   assert.equal(missing.data.references[0].definitionFound,false);
   const found=execute('refs',[...args(root),'--selector','.warning','--file','src/components/CustomerCard.module.css']);
   assert.equal(found.status,0,found.stderr);
+  assert.equal(found.data.definitions.length,1);
+  assert.equal(found.data.references[0].kind,'css-module-property');
+  assert.equal(found.data.references[0].definition,'frontend/src/components/CustomerCard.module.css');
   assert.equal(found.data.references[0].definitionFound,true);
 });
 
 test('HTML class evidence ignores comments, raw text, data attributes, and quoted markup',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/views/status.html',[
     '<!-- <div class="warning"> -->',
     '<div data-class="warning" title="class=warning"></div>',
@@ -524,7 +505,7 @@ test('HTML class evidence ignores comments, raw text, data attributes, and quote
 });
 
 test('JSX global evidence excludes module keys, other attributes, conditions and comment text',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx',[
     'import styles from "./CustomerCard.module.css";',
     '// "warning"',
@@ -543,7 +524,7 @@ test('JSX global evidence excludes module keys, other attributes, conditions and
 });
 
 test('template segments require complete class token boundaries',t=>{
-  const root=fixture(t), tick=String.fromCharCode(96);
+  const root=sourceFixture(t), tick=String.fromCharCode(96);
   put(root,'frontend/src/components/CustomerCard.tsx',[
     'export const a=<div className={'+tick+'warning$'+'{suffix}'+tick+'}/>;',
     'export const b=<div className={'+tick+'warning $'+'{suffix}'+tick+'}/>;',
@@ -555,7 +536,7 @@ test('template segments require complete class token boundaries',t=>{
 });
 
 for (const prefix of ['*','_']) test('CSS comparison retains significant '+prefix+' declaration prefix',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/styles/global.css','.warning{'+prefix+'color:red}');
   git(root,['add','.']);git(root,['commit','-qm','Prefixed declaration']);
   put(root,'frontend/src/styles/global.css','.warning{color:red}');
@@ -565,7 +546,7 @@ for (const prefix of ['*','_']) test('CSS comparison retains significant '+prefi
 });
 
 test('CSS selector formatting is insignificant while combinators and quoted values matter',t=>{
-  const root=fixture(t),entry='frontend/src/styles/global.css';
+  const root=gitFixture(t),entry='frontend/src/styles/global.css';
   put(root,entry,'.warning  > .child , [data-x="a  b"] { color: red }');
   git(root,['add','.']);git(root,['commit','-qm','Selector fixture']);
   put(root,entry,'.warning>.child,[data-x="a  b"]{color:red}');
@@ -580,7 +561,7 @@ test('CSS selector formatting is insignificant while combinators and quoted valu
 });
 
 for(const side of ['both','added','removed']) test('Malformed '+side+' CSS is incomplete verification',t=>{
-  const root=fixture(t),entry='frontend/broken.css';
+  const root=gitFixture(t),entry='frontend/broken.css';
   if(side!=='added') {
     put(root,entry,'.broken { color: red;');
     git(root,['add','.']);git(root,['commit','-qm','Broken CSS']);
@@ -595,7 +576,7 @@ for(const side of ['both','added','removed']) test('Malformed '+side+' CSS is in
 });
 
 for(const loadPath of ['.','frontend','frontend/src','frontend/node_modules/theme']) test('Sass requires explicit include path '+loadPath,t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,loadPath+'/_tokens.scss','$color:red;');
   put(root,'frontend/src/styles/main.scss','@use "tokens"; .warning{color:tokens.$color}');
   git(root,['add','-f',loadPath+'/_tokens.scss','frontend/src/styles/main.scss']);
@@ -608,7 +589,7 @@ for(const loadPath of ['.','frontend','frontend/src','frontend/node_modules/them
 });
 
 test('relative imports resolve emitted JS extensions and mts/cts index files conservatively',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/source.ts','export const source=1;');
   put(root,'frontend/src/esm.mts','export {source} from "./source.js";');
   put(root,'frontend/src/cjs.cts','export {source} from "./esm.mjs";');
@@ -625,7 +606,7 @@ test('relative imports resolve emitted JS extensions and mts/cts index files con
 });
 
 for(const command of ['refs','impact']) test(command+' reports unresolved relative imports as incomplete',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/unresolved.ts','export {x} from "./missing.js";');
   const run=execute(command,[...args(root),...(command==='refs'?['--selector','.warning']:['--file','src/styles/global.css'])]);
   assert.equal(run.status,3,run.stderr);
@@ -634,7 +615,7 @@ for(const command of ['refs','impact']) test(command+' reports unresolved relati
 });
 
 test('evidence totals include all dynamic and speculative references before output limits',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/many.ts','import styles from "./components/CustomerCard.module.css";\n'+
     Array.from({length:350},(_,i)=>'const d'+i+'=styles[key'+i+'];').join('\n')+'\n'+
     Array.from({length:75},(_,i)=>'const s'+i+'="warning";').join('\n'));
@@ -647,7 +628,7 @@ test('evidence totals include all dynamic and speculative references before outp
 });
 
 test('inventory no longer silently caps project manifests at 200',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   for(let i=0;i<205;i++) put(root,'packages/p'+i+'/package.json','{}');
   const run=execute('inventory',['--root',root,'--format','json','--limit','201']);
   assert.equal(run.status,0,run.stderr);
@@ -658,7 +639,7 @@ test('inventory no longer silently caps project manifests at 200',t=>{
 });
 
 test('nested CSS findings report accurate totals and truncation',t=>{
-  const root=fixture(t),entry='frontend/src/styles/global.css';
+  const root=gitFixture(t),entry='frontend/src/styles/global.css';
   put(root,entry,Array.from({length:8},(_,i)=>'.c'+i+'{color:red}').join('\n'));
   git(root,['add','.']);git(root,['commit','-qm','Many rules']);
   put(root,entry,Array.from({length:8},(_,i)=>'.c'+i+'{color:blue}').join('\n'));
@@ -672,11 +653,14 @@ test('nested CSS findings report accurate totals and truncation',t=>{
 
 
 test('impact follows static import() and reports computed imports and require calls',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/lazy.ts','export const page=import("./pages/Dashboard.js");');
   const good=execute('impact',[...args(root),'--file','src/components/CustomerCard.module.css']);
   assert.equal(good.status,0,good.stderr||good.stdout);
   assert.ok(good.data.affectedFiles.includes('frontend/src/lazy.ts'));
+  assert.ok(good.data.affectedFiles.includes('frontend/src/pages/Dashboard.tsx'));
+  assert.ok(good.data.affectedFiles.includes('frontend/src/App.tsx'));
+  assert.ok(!good.data.affectedFiles.includes('frontend/src/pages/Unrelated.tsx'));
   put(root,'frontend/src/dynamic.ts','const a=import(name); const b=require("./lazy");');
   const incomplete=execute('impact',[...args(root),'--file','src/components/CustomerCard.module.css']);
   assert.equal(incomplete.status,3,incomplete.stderr||incomplete.stdout);
@@ -686,7 +670,7 @@ test('impact follows static import() and reports computed imports and require ca
 });
 
 test('CSS Module usages in other JSX attributes remain discoverable',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx','import styles from "./CustomerCard.module.css";\nexport const a=<div title={styles.absent} data-value={styles["absent"]}/>;');
   const run=execute('refs',[...args(root),'--selector','.absent']);
   assert.equal(run.status,0,run.stderr||run.stdout);
@@ -694,7 +678,7 @@ test('CSS Module usages in other JSX attributes remain discoverable',t=>{
 });
 
 test('CSS comparison preserves declaration ordering, importance, and at-rule parameters',t=>{
-  const root=fixture(t), entry='frontend/src/styles/global.css';
+  const root=gitFixture(t), entry='frontend/src/styles/global.css';
   put(root,entry,'@media (min-width: 10px){.x{color:red;color:blue}}');
   git(root,['add','.']);git(root,['commit','-qm','Cascade fixture']);
   for(const css of [
@@ -709,7 +693,7 @@ test('CSS comparison preserves declaration ordering, importance, and at-rule par
 });
 
 for(const failure of ['snapshot write','compiler disposal']) test('comparison cleans temporary snapshots after '+failure+' failure',t=>{
-  const root=fixture(t),log=path.join(root,'temps.json');
+  const root=gitFixture(t),log=path.join(root,'temps.json');
   if(failure==='compiler disposal') put(root,'frontend/main.scss','.x{color:red}');
   const hook=(
     "const fs=require('node:fs'),path=require('node:path'); const original=fs.mkdtempSync; let temp;\n"+
@@ -730,7 +714,7 @@ for(const failure of ['snapshot write','compiler disposal']) test('comparison cl
 });
 
 test('import sequence output limits include nested counts',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   put(root,'frontend/src/imports.ts',Array.from({length:5},(_,i)=>'import "./s'+i+'.css";').join('\n'));
   git(root,['add','.']);git(root,['commit','-qm','Import sequence fixture']);
   put(root,'frontend/src/imports.ts',Array.from({length:5},(_,i)=>'import "./s'+(4-i)+'.css";').join('\n'));
@@ -746,7 +730,7 @@ test('import sequence output limits include nested counts',t=>{
 
 
 test('absolute Sass imports cannot load missing historical project source from worktree',t=>{
-  const root=fixture(t),tokens=path.join(root,'frontend/shared/_tokens.scss');
+  const root=gitFixture(t),tokens=path.join(root,'frontend/shared/_tokens.scss');
   put(root,'frontend/main.scss','@use "'+tokens.replaceAll('\\','/').replace(/^[A-Za-z]:/,'')+'" as tokens; .x{color:tokens.$color}');
   git(root,['add','.']);git(root,['commit','-qm','Absolute Sass import']);
   put(root,'frontend/shared/_tokens.scss','$color:blue;');
@@ -759,7 +743,7 @@ test('absolute Sass imports cannot load missing historical project source from w
 });
 
 test('external Sass load-path junctions cannot alias current project source into history',t=>{
-  const root=fixture(t), external=fs.mkdtempSync(path.join(os.tmpdir(),'style intel alias '));
+  const root=gitFixture(t), external=fs.mkdtempSync(path.join(os.tmpdir(),'style intel alias '));
   t.after(()=>fs.rmSync(external,{recursive:true,force:true,maxRetries:3}));
   put(root,'frontend/main.scss','@use "tokens"; .x{color:tokens.$color}');
   git(root,['add','.']);git(root,['commit','-qm','Unresolved historical Sass import']);
@@ -777,7 +761,7 @@ test('external Sass load-path junctions cannot alias current project source into
 
 
 test('computed CSS Module indices retain nested static module references',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx',[
     'import styles from "./CustomerCard.module.css";',
     'import other from "./Other.module.css";',
@@ -794,7 +778,7 @@ test('computed CSS Module indices retain nested static module references',t=>{
 // Review remediation: R1 preserves class values without treating keys or
 // predicates as class tokens, and keeps interpolation boundaries significant.
 test('R1: refs and impact retain class values in interpolations and indexed arrays',t=>{
-  const root=fixture(t), tick=String.fromCharCode(96);
+  const root=sourceFixture(t), tick=String.fromCharCode(96);
   const expression='flag ? "warning" : ""';
   const interpolate=(before,value,after)=>tick+before+'$'+'{'+value+'}'+after+tick;
   put(root,'frontend/src/components/CustomerCard.tsx',[
@@ -818,7 +802,7 @@ test('R1: refs and impact retain class values in interpolations and indexed arra
 });
 
 for(const hacks of [false,true]) test('R2: empty CSS declarations preserve equality'+(hacks?' alongside property hacks':''),t=>{
-  const root=fixture(t), entry='frontend/src/styles/global.css';
+  const root=gitFixture(t), entry='frontend/src/styles/global.css';
   const normal=hacks?'.a{*color:red;_width:1px}':'.a{color:red;background:blue}';
   put(root,entry,normal);
   git(root,['add','.']);git(root,['commit','-qm','Empty declaration regression baseline']);
@@ -833,7 +817,7 @@ for(const hacks of [false,true]) test('R2: empty CSS declarations preserve equal
 });
 
 test('R3: local require bindings do not mark static analysis incomplete',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/local-loader.ts','export default function require(value){return value;}');
   put(root,'frontend/src/imported-loader.ts','import require from "./local-loader"; export const value=require("field");');
   put(root,'frontend/src/local-require.ts',[
@@ -854,7 +838,7 @@ test('R3: local require bindings do not mark static analysis incomplete',t=>{
 
 for(const declaration of ['', 'declare function require(id:string):unknown;\n'])
   test('R3: '+(declaration?'ambient':'unbound')+' require calls remain unsupported',t=>{
-    const root=fixture(t);
+    const root=sourceFixture(t);
     put(root,'frontend/src/module-loader.ts',declaration+'export const value=require("./missing");');
     const run=execute('impact',[...args(root),'--selector','.warning']);
     assert.equal(run.status,3,run.stderr||run.stdout);
@@ -864,7 +848,7 @@ for(const declaration of ['', 'declare function require(id:string):unknown;\n'])
 
 
 for(const factory of ['named','namespace']) test('R3: Node createRequire '+factory+' loaders remain unsupported',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   const source=factory==='named' ?
     'import {createRequire as makeRequire} from "node:module"; const require=makeRequire(import.meta.url);' :
     'import * as Module from "node:module"; const require=Module.createRequire(import.meta.url);';
@@ -876,7 +860,7 @@ for(const factory of ['named','namespace']) test('R3: Node createRequire '+facto
 });
 
 test('review R1: imported underscore Sass entries are compared and scripts are read once',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   for (const [name,source] of [
     ['static',"import './styles/_static';"],
     ['dynamic',"export const theme=import('./styles/_dynamic.scss');"],
@@ -905,7 +889,7 @@ test('review R1: imported underscore Sass entries are compared and scripts are r
 });
 
 test('review R2: extensionless TypeScript imports prefer ts to tsx for files and indexes',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   for (const stem of ['Choice','folder/index']) {
     put(root,`frontend/src/${stem}.ts`,"import './"+(stem.includes('/')?'../':'')+"styles/global.css'; export const choice=1;");
     put(root,`frontend/src/${stem}.tsx`,"import './"+(stem.includes('/')?'../':'')+"components/Other.module.css'; export const choice=2;");
@@ -920,7 +904,7 @@ test('review R2: extensionless TypeScript imports prefer ts to tsx for files and
 });
 
 test('review R3: import-equals bindings support CSS Module evidence, shadowing and reverse edges',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx',[
     'import styles = require("./CustomerCard.module.css");',
     'export const CustomerCard=()=> <div className={styles.warning}/>;',
@@ -940,7 +924,7 @@ test('review R3: import-equals bindings support CSS Module evidence, shadowing a
 });
 
 test('review R4: transparent CSS Module receiver wrappers preserve references and shadowing',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx',[
     'import styles from "./CustomerCard.module.css";',
     'export const CustomerCard=()=> <div className={(styles).warning}/>;',
@@ -958,7 +942,7 @@ test('review R4: transparent CSS Module receiver wrappers preserve references an
 });
 
 test('review R5: historical comparisons work after the current scope is removed or replaced',t=>{
-  const root=fixture(t);
+  const root=gitFixture(t);
   fs.rmSync(path.join(root,'frontend'),{recursive:true});
   git(root,['add','-A']);git(root,['commit','-qm','Remove frontend']);
   for (const candidate of ['HEAD','worktree']) {
@@ -978,7 +962,7 @@ test('review R5: historical comparisons work after the current scope is removed 
 });
 
 test('review performance: file-filter resolution and warning deduplication stay bounded',t=>{
-  const root=fixture(t);
+  const root=sourceFixture(t);
   for (let i=0;i<150;i++) put(root,`notes/${i}.txt`,'unrelated');
   put(root,'frontend/src/missing.ts',Array.from({length:120},(_,i)=>`import "./missing-${i}";`).join('\n'));
   const selected=path.join(root,'frontend/src/components/CustomerCard.module.css');
