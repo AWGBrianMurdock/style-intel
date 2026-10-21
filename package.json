@@ -6,7 +6,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/style-intel.test.mjs test/git-snapshot.test.mjs"
   },
   "dependencies": {
     "postcss": "^8.5.6",

@@ -151,6 +151,8 @@ Use `$LASTEXITCODE` immediately after the CLI invocation in PowerShell. Structur
 
 ## Test coverage and known limits
 
+`npm test` names the test files explicitly, so it works without shell wildcard expansion in Windows/PowerShell. The GitHub Actions workflow runs it under PowerShell on Windows and Linux with Node.js 20 and 24. Hosted execution requires publishing the workflow; local macOS tests do not establish Windows acceptance.
+
 The bundled `node:test` suite covers missing CSS Module definitions and stylesheets, scoped evidence, HTML/JSX false positives and source locations, React reverse imports and emitted-extension resolution, incomplete parsing/import traversal, paths containing spaces and junction rejection, binary Git stream framing and failures, snapshot cleanup, CSS formatting and meaningful changes, malformed one-sided entries, Sass resolution and historical isolation, import-order risks, directory baselines, output totals/truncation, and exit codes. Tests generate disposable local fixtures and do not require an external application.
 
 ### Suggested Codex instruction
