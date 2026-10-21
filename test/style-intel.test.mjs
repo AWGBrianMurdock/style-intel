@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 
 const CLI=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../style-intel.mjs');
 
@@ -731,7 +731,10 @@ test('import sequence output limits include nested counts',t=>{
 
 test('absolute Sass imports cannot load missing historical project source from worktree',t=>{
   const root=gitFixture(t),tokens=path.join(root,'frontend/shared/_tokens.scss');
-  put(root,'frontend/main.scss','@use "'+tokens.replaceAll('\\','/').replace(/^[A-Za-z]:/,'')+'" as tokens; .x{color:tokens.$color}');
+  // A rooted URL path preserves the Windows drive (/C:/...) without making
+  // the drive letter a URL scheme. Sass also decodes its escaped spaces.
+  const absoluteImport=pathToFileURL(tokens).pathname;
+  put(root,'frontend/main.scss','@use "'+absoluteImport+'" as tokens; .x{color:tokens.$color}');
   git(root,['add','.']);git(root,['commit','-qm','Absolute Sass import']);
   put(root,'frontend/shared/_tokens.scss','$color:blue;');
   const current=execute('verify',[...args(root),'--baseline','worktree','--entry','main.scss']);
