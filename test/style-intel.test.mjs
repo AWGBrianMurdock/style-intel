@@ -110,7 +110,8 @@ for (const selector of ['.root','.customer-card','.warning']) test(`impact ${sel
   put(root,'count-reads.cjs',`
 const fs=require('node:fs'), path=require('node:path');
 const read=fs.readFileSync, counts={};
-const sourceRoot=path.join(__dirname,'frontend')+path.sep;
+// Match the CLI's --root spelling; __dirname resolves symlinked temp directories.
+const sourceRoot=path.join(${JSON.stringify(root)},'frontend')+path.sep;
 fs.readFileSync=function(file,...args) {
   const name=String(file);
   if (name.startsWith(sourceRoot) && /\\.[cm]?[jt]sx?$/i.test(name))
