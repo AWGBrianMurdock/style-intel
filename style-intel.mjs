@@ -458,9 +458,12 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
     if (/\.html?$/i.test(file)) {
       if (!anyGlobal) continue;
       const source = fs.readFileSync(abs,'utf8');
+      let offset=0, line=1;
       for (const attr of htmlClasses(source)) {
-        if (containsExactClass(attr.value,queryName)) addRef(refs,{file,line:source.slice(0,attr.index).split('\n').length,
-          kind:'html-class',confidence:'strong',detail:attr.value},seen);
+        if (!containsExactClass(attr.value,queryName)) continue;
+        // Attribute offsets increase monotonically; scan each prefix only once.
+        while (offset<attr.index) if (source.charCodeAt(offset++)===10) line++;
+        addRef(refs,{file,line,kind:'html-class',confidence:'strong',detail:attr.value},seen);
       }
       continue;
     }

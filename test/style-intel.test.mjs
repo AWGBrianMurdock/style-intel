@@ -1074,6 +1074,26 @@ for (const symlinks of ['true','false']) test(`F2 remediation: regular replaceme
   assert.equal(staged.data.summaryCounts.changed,1);
 });
 
+test('F3 remediation: dense HTML evidence preserves lines with bounded newline scanning',t=>{
+  const root=sourceFixture(t), matches=1000, marker='<!-- F3 line-work fixture -->\r\n';
+  const source=marker+'<div class="other"></div>\r\n<div class="warning"></div>\r\n'.repeat(matches);
+  put(root,'frontend/src/dense.html',source);
+  const hook=`const original=String.prototype.split;let chars=0;
+    String.prototype.split=function(separator,...rest){
+      if(separator==='\\n'&&String(this).startsWith(${JSON.stringify(marker)}))chars+=this.length;
+      return original.call(this,separator,...rest);
+    };
+    process.on('exit',()=>console.error('HTML_LINE_WORK='+chars));`;
+  const run=execute('refs',[...args(root),'--selector','.warning','--file','src/styles/global.css','--limit','5'],
+    {nodeArgs:['--import',`data:text/javascript,${encodeURIComponent(hook)}`]});
+  assert.equal(run.status,0,run.stderr);
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.totals.references,matches+1);
+  assert.deepEqual(run.data.references.map(r=>[r.file,r.line]),[3,5,7,9,11].map(line=>['frontend/src/dense.html',line]));
+  const chars=Number(run.stderr.match(/HTML_LINE_WORK=(\d+)/)[1]);
+  assert.ok(chars<=source.length*2,`Repeated HTML prefix scans processed ${chars} characters for a ${source.length}-character source`);
+});
+
 test('F2 remediation: unchanged symlink placeholders survive configuration changes',t=>{
   const root=gitFixture(t), file='frontend/link.css';
   git(root,['config','core.symlinks','false']);
