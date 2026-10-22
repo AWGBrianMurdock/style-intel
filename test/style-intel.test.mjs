@@ -1046,6 +1046,51 @@ for (const declaration of [
   assert.equal(run.data.summaryCounts.importOrderChanges,0);
 });
 
+for (const symlinks of ['true','false']) test(`F2 remediation: regular replacement of indexed symlink is detected with core.symlinks=${symlinks}`,t=>{
+  const root=gitFixture(t), file='frontend/replacement.css';
+  git(root,['config','core.symlinks',symlinks]);
+  const blob=spawnSync('git',['-C',root,'hash-object','-w','--stdin'],{
+    input:'src/styles/global.css',encoding:'utf8',windowsHide:true});
+  assert.equal(blob.status,0,blob.stderr);
+  git(root,['update-index','--add','--cacheinfo',`120000,${blob.stdout.trim()},${file}`]);
+  git(root,['commit','-qm','Indexed symlink baseline']);
+  // Avoid requiring symlink privileges on Windows: the index is authoritative
+  // for the historical link, while the worktree contains the real replacement.
+  put(root,file,'.replacement{color:green}');
+  for (const entries of [[],['--entry','replacement.css']]) {
+    const run=execute('verify',[...args(root),...entries]);
+    assert.equal(run.status,2,run.stderr||JSON.stringify(run.data?.summaryCounts));
+    assert.equal(run.data.complete,true);
+    assert.equal(run.data.summaryCounts.changed,1);
+    assert.ok(run.data.comparisons.some(c=>c.entry===file && c.details==='Added stylesheet'));
+  }
+  // With core.symlinks=false, git add preserves the old symlink mode. Stage
+  // the regular-file mode explicitly to compare the same actual replacement.
+  const regular=spawnSync('git',['-C',root,'hash-object','-w',file],{encoding:'utf8',windowsHide:true});
+  assert.equal(regular.status,0,regular.stderr);
+  git(root,['update-index','--cacheinfo',`100644,${regular.stdout.trim()},${file}`]);
+  const staged=execute('verify',args(root));
+  assert.equal(staged.status,2,staged.stderr);
+  assert.equal(staged.data.summaryCounts.changed,1);
+});
+
+test('F2 remediation: unchanged symlink placeholders survive configuration changes',t=>{
+  const root=gitFixture(t), file='frontend/link.css';
+  git(root,['config','core.symlinks','false']);
+  const blob=spawnSync('git',['-C',root,'hash-object','-w','--stdin'],{
+    input:'src/styles/global.css',encoding:'utf8',windowsHide:true});
+  assert.equal(blob.status,0,blob.stderr);
+  git(root,['update-index','--add','--cacheinfo',`120000,${blob.stdout.trim()},${file}`]);
+  git(root,['commit','-qm','Symlink placeholder baseline']);
+  git(root,['checkout-index','--force','--',file]);
+  git(root,['config','core.symlinks','true']);
+  const run=execute('verify',args(root));
+  assert.equal(run.status,0,run.stderr||JSON.stringify(run.data?.summaryCounts));
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.summaryCounts.compared,3);
+  assert.ok(run.data.comparisons.every(c=>c.entry!==file));
+});
+
 test('F1 remediation: unchanged extensionless import detects a switch from script to stylesheet',t=>{
   const root=gitFixture(t), spec='./styles/_theme';
   put(root,'frontend/src/styles/_theme.ts','export const theme=1;');

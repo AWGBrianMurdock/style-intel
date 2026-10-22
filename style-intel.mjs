@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { snapshotGitBlobs } from './git-snapshot.mjs';
 
@@ -702,23 +703,33 @@ function trackedSymlinks(root) {
   const probe=spawnSync('git',['-C',root,'rev-parse','--is-inside-work-tree'],{
     encoding:'utf8',windowsHide:true,timeout:10000,
   });
-  if (probe.status!==0 || probe.stdout.trim()!=='true') return new Set();
-  const links=new Set();
+  if (probe.status!==0 || probe.stdout.trim()!=='true') return new Map();
+  const links=new Map();
   const listing=git(root,['ls-files','--stage','-z']).toString('utf8');
   for (const entry of listing.split('\0')) {
     const tab=entry.indexOf('\t');
-    if (tab<0 || entry.slice(0,tab).split(' ')[0]!=='120000') continue;
+    const metadata=entry.slice(0,tab).split(' ');
+    if (tab<0 || metadata[0]!=='120000') continue;
     const file=entry.slice(tab+1);
-    links.add(process.platform==='win32'?file.toLowerCase():file);
+    links.set(process.platform==='win32'?file.toLowerCase():file,metadata[1]);
   }
   return links;
 }
 function filesystemSide(opts,root,kind) {
   const links=trackedSymlinks(root);
-  const eligible=file=>eligibleFile(file) && !links.has(process.platform==='win32'?file.toLowerCase():file);
+  const eligible=file=>{
+    if (!eligibleFile(file)) return false;
+    const oid=links.get(process.platform==='win32'?file.toLowerCase():file);
+    if (!oid) return true;
+    // An indexed link may have been replaced by real source without staging.
+    // Exclude only unchanged placeholders, matching Git's blob hash exactly.
+    const body=fs.readFileSync(path.join(root,file));
+    const actual=createHash(oid.length===64?'sha256':'sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
+    return actual!==oid;
+  };
   const scope=ensureUnder(root,path.join(root,opts.scope));
   const files=(fs.statSync(scope,{throwIfNoEntry:false})?.isDirectory() ? walkFiles(root,scope) : [])
-    .filter(f=>eligible(f)&&(STYLE_EXT.test(f)||SCRIPT_EXT.test(f)));
+    .filter(f=>(STYLE_EXT.test(f)||SCRIPT_EXT.test(f)) && eligible(f));
   // Explicit entries may live outside scope. Sass reads other dependencies
   // directly from this side, so discovery need not traverse the whole tree.
   for (const entry of opts.entries) {
@@ -734,7 +745,7 @@ function filesystemSide(opts,root,kind) {
         if (path.isAbsolute(entry)) throw error;
         continue;
       }
-      if (eligible(relative(root,abs)) && STYLE_EXT.test(file) && fs.statSync(abs,{throwIfNoEntry:false})?.isFile())
+      if (STYLE_EXT.test(file) && fs.statSync(abs,{throwIfNoEntry:false})?.isFile() && eligible(relative(root,abs)))
         pushUnique(files,relative(root,abs));
     }
   }
