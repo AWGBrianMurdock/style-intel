@@ -839,15 +839,17 @@ function summarizeDifference(before,after) {
   return {reorderedOnly:sameMultiset,findings};
 }
 function directImports(side,file) {
-  if (!side.fileSet.has(file)) return {sequence:[],styles:[]};
+  if (!side.fileSet.has(file)) return {sequence:[],styles:[],resolvedStyles:[],hasStyles:false};
   if (side.scriptImports.has(file)) return side.scriptImports.get(file);
   const sf=sourceFile(file,path.join(side.path,file));
   const sequence=[], styles=[];
   const t=ts();
   for (const statement of sf.statements) {
     const specifier=staticModuleSpecifier(statement);
-    if (!specifier || !t.isStringLiteral(specifier)) continue;
-    if (t.isImportDeclaration(statement) || t.isImportEqualsDeclaration(statement)) sequence.push(specifier.text);
+    // Explicit type-only declarations are erased. Runtime re-exports load their
+    // dependencies just as imports do, so retain both in source order.
+    if (!specifier || !t.isStringLiteral(specifier) || statement.isTypeOnly || statement.importClause?.isTypeOnly) continue;
+    sequence.push(specifier.text);
     if (STYLE_EXT.test(specifier.text) || !path.posix.extname(specifier.text)) styles.push(specifier.text);
   }
   function dynamicStyles(node) {
@@ -858,7 +860,10 @@ function directImports(side,file) {
     t.forEachChild(node,dynamicStyles);
   }
   dynamicStyles(sf);
-  const result={sequence,styles};
+  const resolvedStyles=sequence.map(spec=>
+    moduleCandidates(spec,file,side.fileSet).find(target=>STYLE_EXT.test(target)) || null);
+  const hasStyles=sequence.some((spec,i)=>STYLE_EXT.test(spec) || resolvedStyles[i]!==null);
+  const result={sequence,styles,resolvedStyles,hasStyles};
   side.scriptImports.set(file,result); // Retain strings, never repository-wide ASTs.
   return result;
 }
@@ -869,17 +874,21 @@ function compareStyleImportOrder(opts,baseline,candidate) {
   const all=sort(new Set([...baseline.files,...candidate.files].filter(f=>SCRIPT_EXT.test(f)&&inScope(f))));
   const findings=[];
   for (const file of all) {
-    let before,after;
+    let oldImports,newImports;
     try {
-      before=directImports(baseline,file).sequence;
-      after=directImports(candidate,file).sequence;
+      oldImports=directImports(baseline,file);
+      newImports=directImports(candidate,file);
     } catch(e) {
       throw new Error(`Cannot inspect frontend source imports in ${file}: ${e.message}`);
     }
-    const hasStyles=[...before,...after].some(x=>STYLE_EXT.test(x));
-    if (!hasStyles || JSON.stringify(before)===JSON.stringify(after)) continue;
+    const before=oldImports.sequence, after=newImports.sequence;
+    const sameSequence=JSON.stringify(before)===JSON.stringify(after);
+    const sameStyles=JSON.stringify(oldImports.resolvedStyles)===JSON.stringify(newImports.resolvedStyles);
+    if (!(oldImports.hasStyles || newImports.hasStyles) || (sameSequence && sameStyles)) continue;
     findings.push({file,kind:'potential-css-import-order-change',before,after,
-      explanation:'ES import sequence changed in a file that imports styles; global CSS order may change'});
+      explanation:sameSequence
+        ? 'Direct stylesheet resolution changed for an unchanged ES import sequence; global CSS loading may change'
+        : 'ES import/re-export sequence changed in a file that imports styles; global CSS order may change'});
   }
   return findings;
 }

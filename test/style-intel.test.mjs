@@ -983,3 +983,83 @@ test('review performance: file-filter resolution and warning deduplication stay 
     assert.ok(work.warningSearches<=120,`Quadratic warning searches: ${work.warningSearches}`);
   }
 });
+
+for (const form of ['named','star']) test(`F1 remediation: ${form} stylesheet re-exports retain order risks`,t=>{
+  const root=gitFixture(t), first='./styles/first.css', second='./styles/second.css';
+  put(root,'frontend/src/styles/first.css','.warning{color:red}');
+  put(root,'frontend/src/styles/second.css','.warning{color:blue}');
+  const statement=(spec,name)=>form==='named' ? `export {default as ${name}} from "${spec}";` : `export * from "${spec}";`;
+  put(root,'frontend/src/exports.ts',statement(first,'first')+'\n'+statement(second,'second'));
+  git(root,['add','.']);git(root,['commit','-qm','Stylesheet re-export baseline']);
+  put(root,'frontend/src/exports.ts',statement(second,'second')+'\n'+statement(first,'first'));
+  const run=execute('verify',args(root));
+  assert.equal(run.status,2,run.stderr||run.stdout);
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.summaryCounts.changed,0);
+  assert.equal(run.data.summaryCounts.importOrderChanges,1);
+  assert.deepEqual(run.data.importChanges[0].before,[first,second]);
+  assert.deepEqual(run.data.importChanges[0].after,[second,first]);
+});
+
+test('F1 remediation: extensionless resolved Sass imports retain order risks',t=>{
+  const root=gitFixture(t), first='./styles/_first', second='./styles/_second';
+  put(root,'frontend/src/styles/_first.scss','.warning{color:red}');
+  put(root,'frontend/src/styles/_second.scss','.warning{color:blue}');
+  put(root,'frontend/src/imports.ts',`import "${first}";\nimport "${second}";`);
+  git(root,['add','.']);git(root,['commit','-qm','Extensionless Sass baseline']);
+  put(root,'frontend/src/imports.ts',`import "${second}";\nimport "${first}";`);
+  const run=execute('verify',args(root));
+  assert.equal(run.status,2,run.stderr||run.stdout);
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.summaryCounts.changed,0);
+  assert.equal(run.data.summaryCounts.compared,5);
+  assert.equal(run.data.summaryCounts.importOrderChanges,1);
+});
+
+test('F1 remediation: a type-only CSS import becoming a runtime import is detected',t=>{
+  const root=gitFixture(t), spec='./components/CustomerCard.module.css';
+  put(root,'frontend/src/theme.ts',`import type styles from "${spec}"; export type Theme=typeof styles;`);
+  git(root,['add','.']);git(root,['commit','-qm','Type-only CSS baseline']);
+  put(root,'frontend/src/theme.ts',`import styles from "${spec}"; export const theme=styles;`);
+  const run=execute('verify',args(root));
+  assert.equal(run.status,2,run.stderr||run.stdout);
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.summaryCounts.changed,0);
+  assert.deepEqual(run.data.importChanges[0].before,[]);
+  assert.deepEqual(run.data.importChanges[0].after,[spec]);
+});
+
+for (const declaration of [
+  'import type styles from "./styles/_types.scss";',
+  'import type styles = require("./styles/_types.scss");',
+  'export type {Styles} from "./styles/_types.scss";',
+]) test(`F1 remediation: type-only declaration is excluded from CSS entries and order: ${declaration}`,t=>{
+  const root=gitFixture(t), runtime='import "./styles/global.css";';
+  put(root,'frontend/src/styles/_types.scss','@error "type-only dependency must not compile";');
+  put(root,'frontend/src/types.ts',declaration+'\n'+runtime);
+  git(root,['add','.']);git(root,['commit','-qm','Type-only Sass baseline']);
+  put(root,'frontend/src/types.ts',runtime+'\n'+declaration);
+  const run=execute('verify',args(root));
+  assert.equal(run.status,0,run.stderr||run.stdout);
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.summaryCounts.compared,3);
+  assert.equal(run.data.summaryCounts.importOrderChanges,0);
+});
+
+test('F1 remediation: unchanged extensionless import detects a switch from script to stylesheet',t=>{
+  const root=gitFixture(t), spec='./styles/_theme';
+  put(root,'frontend/src/styles/_theme.ts','export const theme=1;');
+  put(root,'frontend/src/styles/_theme.scss','.warning{color:red}');
+  put(root,'frontend/src/theme.ts',`import "${spec}";`);
+  git(root,['add','.']);git(root,['commit','-qm','Script shadows Sass entry']);
+  fs.unlinkSync(path.join(root,'frontend/src/styles/_theme.ts'));
+  const run=execute('verify',args(root));
+  assert.equal(run.status,2,run.stderr||JSON.stringify(run.data?.summaryCounts));
+  assert.equal(run.data.complete,true);
+  assert.equal(run.data.summaryCounts.compared,4);
+  assert.equal(run.data.summaryCounts.changed,0);
+  assert.equal(run.data.summaryCounts.importOrderChanges,1);
+  assert.deepEqual(run.data.importChanges[0].before,[spec]);
+  assert.deepEqual(run.data.importChanges[0].after,[spec]);
+  assert.match(run.data.importChanges[0].explanation,/resolution/);
+});

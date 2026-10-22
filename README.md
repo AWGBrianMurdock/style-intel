@@ -157,7 +157,7 @@ node $Tool compare --root $Repo --scope $Scope `
 
 `--baseline` and `--candidate` accept `worktree`, a Git commit or ref, or a directory containing a mirror of the original repository tree. For Git refs, the tool resolves an immutable commit, streams blobs using `git cat-file --batch`, writes tracked CSS/SCSS/Sass sources across the repository and scoped JS/TS files into a **unique OS temporary directory**, and deletes that directory at the end. It does **not** change branches, stash, checkout, or reset Git files. Untracked working-tree files are included in filesystem analysis but are absent from Git snapshots.
 
-Comparison scopes may be absent from the current worktree if a requested snapshot contains them. Automatic entry discovery includes non-partial stylesheets plus underscore-prefixed Sass files directly imported by scoped JS/TS through static imports, re-exports, import-equals declarations, or literal `import()` calls. Unimported Sass partials remain dependencies; use `--entry` to select one explicitly. Entry discovery and import-order analysis share one script read per file per side and retain only compact import data.
+Comparison scopes may be absent from the current worktree if a requested snapshot contains them. Automatic entry discovery includes non-partial stylesheets plus underscore-prefixed Sass files directly imported by scoped JS/TS through runtime static imports, re-exports, import-equals declarations, or literal `import()` calls. Explicit type-only import/export declarations are excluded. Unimported Sass partials remain dependencies; use `--entry` to select one explicitly. Entry discovery and import-order analysis share one script read per file per side and retain only compact import data.
 
 The comparison is order-sensitive and intentionally conservative. Treat its results as static evidence: Sass is compiled entry by entry, and the application build pipeline and browser behavior are not reproduced.
 
@@ -165,7 +165,7 @@ The comparison is order-sensitive and intentionally conservative. Treat its resu
 - `reordered` — the same canonicalized AST nodes and rule blocks appear in different order; a cascade change is possible.
 - `changed` — declarations, selectors, at-rules, or entries changed.
 - `error` - compilation or CSS/selector parsing could not be completed, including an added or removed entry whose existing side is malformed; the verification is **incomplete**, not a pass. Parsers are not full CSS specification validators.
-- `importChanges` — JS/TS source that directly imports CSS/SCSS/Sass had its static import sequence changed, including TypeScript import-equals declarations. Such a change is treated as a *potential* CSS-order regression even if all compiled CSS ASTs are equal; this does not reproduce a bundler's complete dependency execution order.
+- `importChanges` — JS/TS source that directly imports or re-exports CSS/SCSS/Sass had its runtime static import/re-export sequence or resolved stylesheet targets changed, including TypeScript import-equals declarations and extensionless imports resolved to stylesheets. Such a change is treated as a *potential* CSS-order regression even if all compiled CSS ASTs are equal; this does not reproduce a bundler's complete dependency execution order.
 
 JSON identifies the verification performed with `verification: {staticCss: true, applicationBuild: false, browser: false}`; `complete` and comparison statuses report whether that static analysis succeeded.
 
