@@ -62,6 +62,73 @@ function gitFixture(t) {
 }
 const args = root => ['--root',root,'--scope','frontend','--format','json'];
 
+test('remediation F1: CSS normalization preserves non-ASCII and escaped whitespace',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'style intel whitespace candidate '));
+  const baseline=fs.mkdtempSync(path.join(os.tmpdir(),'style intel whitespace baseline '));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  t.after(()=>fs.rmSync(baseline,{recursive:true,force:true}));
+  const entry='frontend/main.css';
+  const cases=[
+    ['declaration NBSP','.x{color:blue;color:red}', '.x{color:blue;color:red\u00a0}',2],
+    ['media NBSP','@media screen{.x{color:red}}','@media screen\u00a0{.x{color:red}}',2],
+    ['escaped custom value','.x{--name:foo\\ ;animation-name:var(--name)}','.x{--name:foo\\\t;animation-name:var(--name)}',2],
+    ['ordinary formatting','@media screen{.x{--name:foo;color:red}}','@media  screen  { .x { --name: foo  ; color: red ; } }',0],
+    ['space after escape','.x{--name:foo\\ }','.x{--name:foo\\  }',0],
+    ['space after escaped backslash','.x{--name:foo\\\\}','.x{--name:foo\\\\  }',0],
+  ];
+  for(const [label,before,after,status] of cases) {
+    put(baseline,entry,before);
+    put(root,entry,after);
+    const run=execute('verify',[...args(root),'--baseline',baseline,'--entry',entry]);
+    assert.equal(run.status,status,label+': '+(run.stderr||JSON.stringify(run.data?.comparisons)));
+    assert.equal(run.data.complete,true,label);
+    assert.equal(run.data.comparisons[0].status,status===0?'structurally-equal':'changed',label);
+  }
+});
+
+test('remediation F2: global references survive absent definitions without leaking into module filters',t=>{
+  const root=sourceFixture(t), global='frontend/src/styles/orphan.css';
+  put(root,'frontend/src/Orphan.tsx',[
+    'export const literal=<div className="orphan"/>;',
+    'export const expression=<div className={flag ? "orphan" : ""}/>;',
+    'document.body.classList.add("orphan");',
+    'export const candidate="orphan";',
+    'export const dynamic=<div className={`orphan ${suffix}`}/>;',
+  ].join('\n'));
+  put(root,'frontend/src/orphan.html','<div class="orphan"></div>');
+  put(root,'frontend/src/Orphan.module.css','.orphan{color:blue}');
+  put(root,'frontend/src/ModuleUser.tsx','import s from "./Orphan.module.css"; export const value=s.orphan;');
+  put(root,'frontend/src/App.tsx','import "./Orphan";');
+  const query=[...args(root),'--selector','.orphan'];
+  for(const state of ['missing stylesheet','missing selector','defined']) {
+    if(state==='missing selector') put(root,global,'.other{color:red}');
+    if(state==='defined') put(root,global,'.orphan{color:red}');
+    for(const filter of [[],['--file','src/styles/orphan.css']]) {
+      const run=execute('refs',[...query,...filter]);
+      assert.equal(run.status,0,run.stderr);
+      assert.equal(run.data.complete,true);
+      const globals=run.data.references.filter(ref=>!ref.stylesheet);
+      assert.deepEqual(globals.map(ref=>ref.kind).sort(),[
+        'classList','html-class','jsx-class','jsx-class-expression','static-template-segment','unclassified-string',
+      ].sort(),state);
+      assert.ok(globals.every(ref=>ref.definitionFound===(state==='defined')),state);
+      const modules=run.data.references.filter(ref=>ref.stylesheet);
+      assert.equal(modules.length,filter.length?0:1);
+      assert.ok(modules.every(ref=>ref.definitionFound));
+      assert.equal(run.data.possibleDynamic.length,1);
+      const impact=execute('impact',[...query,...filter]);
+      assert.equal(impact.status,0,impact.stderr);
+      assert.ok(impact.data.affectedFiles.includes('frontend/src/Orphan.tsx'),state);
+      assert.ok(impact.data.affectedFiles.includes('frontend/src/App.tsx'),state);
+    }
+  }
+  const moduleOnly=execute('refs',[...query,'--file','src/Orphan.module.css']);
+  assert.equal(moduleOnly.status,0,moduleOnly.stderr);
+  assert.equal(moduleOnly.data.references.length,1);
+  assert.equal(moduleOnly.data.references[0].file,'frontend/src/ModuleUser.tsx');
+  assert.equal(moduleOnly.data.possibleDynamic.length,0);
+});
+
 test('inventory detects React and Java manifests in a path containing spaces',t=>{
   const root=sourceFixture(t);
   const run=execute('inventory',['--root',root,'--format','json']);

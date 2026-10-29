@@ -455,13 +455,16 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
   const known = new Set(files);
   const refs=[], dynamic=[], seen = new Set();
   const moduleDefs = new Set(definitions.filter(d=>d.module).map(d=>d.file));
-  const anyGlobal = definitions.some(d=>!d.module);
+  const globalDefinitionFound = definitions.some(d=>!d.module);
+  // Literal global consumers remain evidence after a definition is removed.
+  // A selected CSS Module must still exclude unrelated global class strings.
+  const includeGlobal = selected===null || (STYLE_EXT.test(selected) && !/\.module\.(?:css|scss|sass)$/i.test(selected));
   const moduleAllowed=f=>/\.module\.(?:css|scss|sass)$/i.test(f) && (!selected || f===selected);
   const t = ts();
   for (const file of sourceFiles) {
     const abs = path.join(opts.root,file);
     if (/\.html?$/i.test(file)) {
-      if (!anyGlobal) continue;
+      if (!includeGlobal) continue;
       const source = fs.readFileSync(abs,'utf8');
       let offset=0, line=1;
       for (const attr of htmlClasses(source)) {
@@ -537,7 +540,7 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
           t.forEachChild(node,child=>walk(child,false));return;
         }
         if (node.initializer && t.isStringLiteral(node.initializer)) {
-          if (anyGlobal && containsExactClass(node.initializer.text,queryName))
+          if (includeGlobal && containsExactClass(node.initializer.text,queryName))
             addRef(refs,{file,line:line(node),kind:'jsx-class',confidence:'strong',detail:node.initializer.text},seen);
         } else if (node.initializer && t.isJsxExpression(node.initializer)) {
           if (node.initializer.expression) walk(node.initializer.expression,true);
@@ -553,7 +556,7 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
         walk(node.right,[t.SyntaxKind.PlusToken,t.SyntaxKind.AmpersandAmpersandToken,t.SyntaxKind.BarBarToken,t.SyntaxKind.QuestionQuestionToken].includes(op));
         return;
       }
-      if (t.isStringLiteralLike(node) && anyGlobal) {
+      if (t.isStringLiteralLike(node) && includeGlobal) {
         if (inClassExpr && containsExactClass(node.text,queryName))
           addRef(refs,{file,line:line(node),kind:'jsx-class-expression',confidence:'probable',detail:node.text.slice(0,120)},seen);
         else if (!inClassExpr && node.text===queryName && unclassified(node))
@@ -561,14 +564,14 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
       }
       if (inClassExpr && (t.isPropertyAssignment(node) || t.isShorthandPropertyAssignment(node))) {
         const key = node.name && (t.isIdentifier(node.name) || t.isStringLiteral(node.name)) ? node.name.text : null;
-        if (anyGlobal && key === queryName) addRef(refs,{file,line:line(node),kind:'class-object-key',confidence:'probable',detail:key},seen);
+        if (includeGlobal && key === queryName) addRef(refs,{file,line:line(node),kind:'class-object-key',confidence:'probable',detail:key},seen);
         if (t.isPropertyAssignment(node)) walk(node.initializer,false);
         return;
       }
       if (inClassExpr && t.isTemplateExpression(node)) {
         dynamic.push({file,line:line(node),kind:'dynamic-class-template'});
         const parts=[node.head.text,...node.templateSpans.map(x=>x.literal.text)];
-        if (anyGlobal) {
+        if (includeGlobal) {
           // Do not treat interpolation boundaries as complete class tokens.
           if (containsExactClass(parts.join('\0'),queryName))
             addRef(refs,{file,line:line(node),kind:'static-template-segment',confidence:'probable',detail:queryName},seen);
@@ -586,7 +589,7 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
       }
       if (t.isCallExpression(node) && t.isPropertyAccessExpression(node.expression) &&
           ['add','remove','toggle','contains','replace'].includes(node.expression.name.text) &&
-          t.isPropertyAccessExpression(node.expression.expression) && node.expression.expression.name.text === 'classList' && anyGlobal) {
+          t.isPropertyAccessExpression(node.expression.expression) && node.expression.expression.name.text === 'classList' && includeGlobal) {
         for (const arg of node.arguments) if (t.isStringLiteralLike(arg) && arg.text === queryName)
           addRef(refs,{file,line:line(node),kind:'classList',confidence:'strong',detail:arg.text},seen);
       }
@@ -597,9 +600,10 @@ function gatherReferences(opts, queryName, definitions, files, warnings, scriptI
     const classifiedLines=new Set(refs.slice(firstRef).filter(r=>r.confidence!=='possible').map(r=>r.line));
     for (const ref of fallback) if (!classifiedLines.has(ref.line)) addRef(refs,ref,seen);
   }
+  for (const ref of refs) if (!ref.stylesheet) ref.definitionFound=globalDefinitionFound;
   const confidenceRank={strong:0,probable:1,possible:2};
   refs.sort((a,b)=>confidenceRank[a.confidence]-confidenceRank[b.confidence] || a.file.localeCompare(b.file)||a.line-b.line||a.kind.localeCompare(b.kind));
-  return {refs,dynamic:dynamic.filter(d=>d.definition ? moduleAllowed(d.definition) : anyGlobal)};
+  return {refs,dynamic:dynamic.filter(d=>d.definition ? moduleAllowed(d.definition) : includeGlobal)};
 }
 function refsCommand(opts, filesArg, scriptImports, selected=opts.file ? asRepoPath(opts.root,opts.scopeAbs,opts.file) : null) {
   if (!opts.selector) throw new Error('refs requires --selector .class-name');
@@ -820,11 +824,24 @@ function canonicalCss(source, label) {
   const ast=postcss().parse(source,{from:label});
   const nodes=[];
   const blocks=[];
+  function trimWhitespace(value) {
+    // JavaScript trim also removes non-ASCII characters that are not CSS
+    // whitespace. A trailing space/tab escaped by an odd run of backslashes
+    // belongs to its token; only the whitespace after it is insignificant.
+    const whitespace=/[\t\n\f\r ]/;
+    let start=0, end=value.length;
+    while (start<end && whitespace.test(value[start])) start++;
+    while (end>start && whitespace.test(value[end-1])) end--;
+    let slashes=0;
+    for (let i=end-1;i>=start && value[i]==='\\';i--) slashes++;
+    if (end<value.length && slashes%2) end++;
+    return value.slice(start,end);
+  }
   const declaration=n=>{
     // PostCSS moves * and _ property hacks to the end of raws.before, which
     // can also contain insignificant whitespace and empty declarations.
     const prefix=(n.raws.before||'').match(/[*_]$/)?.[0] || '';
-    return [prefix+n.prop,n.value.trim(),!!n.important];
+    return [prefix+n.prop,trimWhitespace(n.value),!!n.important];
   };
   const selector=n=>selectorParser()(selectors=>selectors.walkComments(comment=>{
     const before=comment.prev(), after=comment.next();
@@ -852,8 +869,9 @@ function canonicalCss(source, label) {
         visit(n,parents);
         nodes.push(['/rule']);
       } else if (n.type === 'atrule') {
-        nodes.push(['@'+n.name,n.params.trim(),Boolean(n.nodes)]);
-        if (n.nodes) {visit(n,[...parents,`@${n.name} ${n.params.trim()}`]);nodes.push(['/@'+n.name]);}
+        const params=trimWhitespace(n.params);
+        nodes.push(['@'+n.name,params,Boolean(n.nodes)]);
+        if (n.nodes) {visit(n,[...parents,`@${n.name} ${params}`]);nodes.push(['/@'+n.name]);}
       }
     }
   }
