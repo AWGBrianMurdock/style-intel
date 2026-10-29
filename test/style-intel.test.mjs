@@ -471,6 +471,33 @@ for (const missingSheet of [false,true]) test('CSS Module usages survive missing
   assert.deepEqual(impact.data.input,{selector:'.absent',file:'frontend/src/components/'+sheet});
 });
 
+test('F1 remediation: missing stylesheet evidence is independent of file path spelling',t=>{
+  const root=sourceFixture(t),sheet='frontend/src/components/Gone.module.css';
+  put(root,'frontend/src/components/CustomerCard.tsx',
+    'import styles from "./Gone.module.css"; export const value=styles.warning;');
+  const paths=['src/components/Gone.module.css',sheet,'./'+sheet,path.join(root,sheet)];
+  for (const command of ['refs','impact']) {
+    let expected;
+    for (const file of paths) {
+      const run=execute(command,[...args(root),'--selector','.warning','--file',file]);
+      assert.equal(run.status,3,run.stderr);
+      assert.equal(run.data.complete,false);
+      assert.match(run.data.warnings.join('\n'),/Unresolved relative import.*Gone\.module\.css/);
+      if (command==='refs') {
+        assert.equal(run.data.references.length,1,file);
+        assert.equal(run.data.references[0].stylesheet,sheet);
+        assert.equal(run.data.references[0].definitionFound,false);
+      } else {
+        assert.equal(run.data.input.file,sheet);
+        assert.ok(run.data.affectedFiles.includes('frontend/src/App.tsx'),file);
+        assert.equal(run.data.selectorEvidence.references,1);
+      }
+      if (expected) assert.deepEqual(run.data,expected,file);
+      else expected=run.data;
+    }
+  }
+});
+
 test('CSS Module references report matched definitions separately',t=>{
   const root=sourceFixture(t);
   put(root,'frontend/src/components/CustomerCard.tsx','import s from "./CustomerCard.module.css";\nexport const a=s.absent;\nexport const b=s.warning;');
@@ -1127,4 +1154,83 @@ test('F1 remediation: unchanged extensionless import detects a switch from scrip
   assert.deepEqual(run.data.importChanges[0].before,[spec]);
   assert.deepEqual(run.data.importChanges[0].after,[spec]);
   assert.match(run.data.importChanges[0].explanation,/resolution/);
+});
+
+test('audit F1: scoped import resolution agrees across Git, worktree, and directory sides',t=>{
+  const root=gitFixture(t), backup=fs.mkdtempSync(path.join(os.tmpdir(),'style intel scoped baseline '));
+  t.after(()=>fs.rmSync(backup,{recursive:true,force:true}));
+  put(root,'shared/theme.css','.shared{color:red}');
+  put(root,'shared/_choice.scss','.choice{color:blue}');
+  put(root,'shared/_choice.ts','export const choice=1;');
+  put(root,'frontend/src/shared.ts','import "../../shared/theme.css"; import "../../shared/_choice";');
+  // Preserve the existing exact-name resolution policy on case-insensitive disks.
+  put(root,'frontend/src/case.ts','import "../../shared/Theme.css";');
+  git(root,['add','.']);git(root,['commit','-qm','Cross-scope imports']);
+  for(const dir of ['frontend','shared']) fs.cpSync(path.join(root,dir),path.join(backup,dir),{recursive:true});
+  // Import resolution may probe candidates, but must not scan unrelated trees.
+  const hook=`import fs from 'node:fs';import path from 'node:path';const read=fs.readdirSync;
+    fs.readdirSync=function(dir,...rest){if(['shared','backend'].includes(path.basename(String(dir))))throw new Error('Out-of-scope traversal');return read.call(this,dir,...rest);};`;
+  for(const [baseline,candidate] of [['HEAD','worktree'],['worktree','HEAD'],['HEAD',backup],[backup,'HEAD']]) {
+    const run=execute('verify',[...args(root),'--baseline',baseline,'--candidate',candidate],
+      {nodeArgs:['--import',`data:text/javascript,${encodeURIComponent(hook)}`]});
+    assert.equal(run.status,0,run.stderr||JSON.stringify(run.data?.importChanges));
+    assert.equal(run.data.complete,true);
+    assert.equal(run.data.summaryCounts.importOrderChanges,0);
+    assert.ok(run.data.comparisons.every(c=>c.entry.startsWith('frontend/')));
+  }
+  fs.unlinkSync(path.join(root,'shared/_choice.ts'));
+  const changed=execute('verify',args(root));
+  assert.equal(changed.status,2,changed.stderr);
+  assert.equal(changed.data.summaryCounts.changed,0);
+  assert.equal(changed.data.summaryCounts.importOrderChanges,1);
+  assert.match(changed.data.importChanges[0].explanation,/resolution/);
+});
+
+test('F2 remediation: nth selector comments preserve signed numeric token boundaries',t=>{
+  const root=gitFixture(t),entry='frontend/src/styles/global.css';
+  const verify=()=>execute('verify',[...args(root),'--entry',entry]);
+  for (const pseudo of ['nth-child','nth-last-child','nth-of-type','nth-last-of-type']) {
+    put(root,entry,`:${pseudo}(+2n) {color:red}`);
+    git(root,['add',entry]);git(root,['commit','-qm','Signed nth selector']);
+    for (const separator of ['/**/','/*note*/','/**//**/']) {
+      put(root,entry,`:${pseudo}(+${separator}2n) {color:red}`);
+      const changed=verify();
+      assert.equal(changed.status,2,changed.stderr||JSON.stringify(changed.data?.comparisons));
+      assert.equal(changed.data.summaryCounts.changed,1);
+    }
+  }
+  // Comments at real combinators or between separate An+B terms are harmless.
+  const before='.a+.b, :nth-child(2n+1), :nth-child(+n) {color:red}';
+  put(root,entry,before);
+  git(root,['add',entry]);git(root,['commit','-qm','Insignificant selector comments']);
+  put(root,entry,'.a+/**/.b, :nth-child(2n+/**/1), :nth-child(+/**/n) {color:red}');
+  const equal=verify();
+  assert.equal(equal.status,0,equal.stderr||JSON.stringify(equal.data?.comparisons));
+});
+
+test('audit F2: selector comments are insignificant without losing selector boundaries',t=>{
+  const root=gitFixture(t),entry='frontend/src/styles/global.css';
+  put(root,entry,'.a.b, .a .b, :is(.a.b), [data-note="/*keep*/"] {color:red}');
+  git(root,['add','.']);git(root,['commit','-qm','Selector comment baseline']);
+  put(root,entry,'.a/**/.b, .a /*note*/ .b, :is(.a/**/.b), [data-note="/*keep*/"] {color:red}');
+  const equal=execute('verify',[...args(root),'--entry',entry]);
+  assert.equal(equal.status,0,equal.stderr||JSON.stringify(equal.data?.comparisons));
+  assert.equal(equal.data.comparisons[0].status,'structurally-equal');
+  for(const selector of [
+    '.a .b, .a .b, :is(.a.b), [data-note="/*keep*/"]',
+    '.a.b, .a .b, :is(.a.b), [data-note="keep"]',
+  ]) {
+    put(root,entry,selector+' {color:red}');
+    const changed=execute('verify',[...args(root),'--entry',entry]);
+    assert.equal(changed.status,2,changed.stderr);
+  }
+  // Parser acceptance is not CSS validation: stripping comments must not turn
+  // separate tokens into a different, valid selector.
+  for(const [before,after] of [['ab','a/**/b'],['.ab','.a/**/b'],['a|b','a/**/|b']]) {
+    put(root,entry,before+' {color:red}');
+    git(root,['add',entry]);git(root,['commit','-qm','Selector token boundary']);
+    put(root,entry,after+' {color:red}');
+    const changed=execute('verify',[...args(root),'--entry',entry]);
+    assert.equal(changed.status,2,changed.stderr);
+  }
 });

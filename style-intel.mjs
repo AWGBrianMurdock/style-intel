@@ -53,7 +53,12 @@ function asRepoPath(root, scope, input) {
   });
   if (!possible.length) throw new Error(`Path is outside --root: ${input}`);
   const found=possible.find(p=>fs.existsSync(p));
-  return relative(root, found || possible[possible.length-1]);
+  // Missing stylesheets still have import identities. Do not prepend scope
+  // again when the normalized root-relative input already lies within it.
+  const rootCandidate=path.resolve(root,input), withinScope=path.relative(scope,rootCandidate);
+  const scopedRoot=possible.includes(rootCandidate) && withinScope!=='..' &&
+    !withinScope.startsWith('..'+path.sep) && !path.isAbsolute(withinScope);
+  return relative(root, found || (scopedRoot ? rootCandidate : possible[possible.length-1]));
 }
 // These append-only evidence arrays retain their output order without repeated scans.
 const uniqueValues = new WeakMap();
@@ -685,21 +690,24 @@ async function snapshotRevision(opts, rev, tempParent) {
   if (!/^[a-fA-F0-9]{40,64}$/.test(sha)) throw new Error(`Cannot resolve Git revision: ${rev}`);
   const list=git(opts.root,['ls-tree','-rz','--full-tree',sha]);
   const blobs=[];
+  const resolutionFiles=new Set();
   const inScope = f => opts.scope==='.' || f===opts.scope || f.startsWith(opts.scope+'/');
   for (const entry of list.toString('utf8').split('\0')) {
     if (!entry) continue;
     const tab=entry.indexOf('\t');
     const head=entry.slice(0,tab).split(' '), name=entry.slice(tab+1);
+    if (head[1] !== 'blob' || !['100644','100755'].includes(head[0])) continue;
+    // Resolve cross-scope imports using metadata without reading those scripts.
+    if (eligibleFile(name) && (STYLE_EXT.test(name) || SCRIPT_EXT.test(name))) resolutionFiles.add(name);
     // Materialize all tracked style sources for Sass dependency resolution.
     // Ignored files stay out of side.files, which controls entry discovery.
-    if (head[1] === 'blob' && ['100644','100755'].includes(head[0]) &&
-        (STYLE_EXT.test(name) || (eligibleFile(name) && SCRIPT_EXT.test(name) && inScope(name)))) blobs.push({oid:head[2],name});
+    if (STYLE_EXT.test(name) || (eligibleFile(name) && SCRIPT_EXT.test(name) && inScope(name))) blobs.push({oid:head[2],name});
   }
   const snapshot=path.join(tempParent,sha.slice(0,12));
   fs.mkdirSync(snapshot,{recursive:true});
   if (blobs.length) await snapshotGitBlobs(opts.root,blobs,item=>
     ensureUnder(snapshot,path.resolve(snapshot,item.name)));
-  return {kind:'git',revision:sha,path:snapshot,files:blobs.map(x=>x.name).filter(eligibleFile)};
+  return {kind:'git',revision:sha,path:snapshot,files:blobs.map(x=>x.name).filter(eligibleFile),resolutionFiles};
 }
 function trackedSymlinks(root) {
   // Directory-only comparisons also work without Git or repository metadata.
@@ -752,7 +760,26 @@ function filesystemSide(opts,root,kind) {
         pushUnique(files,relative(root,abs));
     }
   }
-  return {kind,revision:null,path:root,files};
+  // Resolve only requested candidates outside discovery scope. Cache probes so
+  // shared imports do not repeat filesystem checks or require a broader walk.
+  const resolved=new Map(files.map(file=>[file,true]));
+  let realRoot;
+  const resolutionFiles={has(file) {
+    if (resolved.has(file)) return resolved.get(file);
+    let found=false;
+    if (eligibleFile(file) && (STYLE_EXT.test(file) || SCRIPT_EXT.test(file))) {
+      let abs;
+      try {abs=ensureUnder(root,path.resolve(root,file));} catch { /* Unsupported path. */ }
+      if (abs && fs.statSync(abs,{throwIfNoEntry:false})?.isFile() && eligible(file)) {
+        // Match Git's exact path names even on case-insensitive filesystems.
+        realRoot??=fs.realpathSync.native(root);
+        found=relative(realRoot,fs.realpathSync.native(abs))===file;
+      }
+    }
+    resolved.set(file,found);
+    return found;
+  }};
+  return {kind,revision:null,path:root,files,resolutionFiles};
 }
 async function prepareSide(opts, spec, tempParent) {
   const directory=path.resolve(spec);
@@ -799,7 +826,19 @@ function canonicalCss(source, label) {
     const prefix=(n.raws.before||'').match(/[*_]$/)?.[0] || '';
     return [prefix+n.prop,n.value.trim(),!!n.important];
   };
-  const selector=n=>selectorParser()().processSync(n.selector,{lossless:false});
+  const selector=n=>selectorParser()(selectors=>selectors.walkComments(comment=>{
+    const before=comment.prev(), after=comment.next();
+    // In An+B, the parser labels a leading '+' as a combinator. Removing its
+    // separator before a number would turn invalid +/**/2n into valid +2n.
+    const signedNumber=before?.type==='combinator' && before.value==='+' && !before.prev() &&
+      after?.type==='tag' && /^\d/.test(after.value) &&
+      /^:nth-(?:last-)?(?:child|of-type)$/i.test(comment.parent?.parent?.value || '');
+    // Keep a normalized separator where removal could merge tokens (a/**/b)
+    // or create a namespace (a/**/|b). Other selector comments are insignificant.
+    if (signedNumber || (before && before.type!=='combinator' && after && ['tag','universal'].includes(after.type)))
+      comment.value='/**/';
+    else comment.remove();
+  })).processSync(n.selector,{lossless:false});
   function visit(container,parents) {
     for (const n of (container.nodes||[])) {
       if (n.type === 'comment') continue;
@@ -875,7 +914,7 @@ function directImports(side,file) {
   }
   dynamicStyles(sf);
   const resolvedStyles=sequence.map(spec=>
-    moduleCandidates(spec,file,side.fileSet).find(target=>STYLE_EXT.test(target)) || null);
+    moduleCandidates(spec,file,side.resolutionFiles).find(target=>STYLE_EXT.test(target)) || null);
   const hasStyles=sequence.some((spec,i)=>STYLE_EXT.test(spec) || resolvedStyles[i]!==null);
   const result={sequence,styles,resolvedStyles,hasStyles};
   side.scriptImports.set(file,result); // Retain strings, never repository-wide ASTs.
