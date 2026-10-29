@@ -1235,8 +1235,12 @@ test('audit F1: scoped import resolution agrees across Git, worktree, and direct
   git(root,['add','.']);git(root,['commit','-qm','Cross-scope imports']);
   for(const dir of ['frontend','shared']) fs.cpSync(path.join(root,dir),path.join(backup,dir),{recursive:true});
   // Import resolution may probe candidates, but must not scan unrelated trees.
+  // Guard fixture sources, not temporary snapshot cleanup: Node 20's rmSync
+  // calls readdirSync while removing those snapshots.
+  const guarded=[root,backup].flatMap(dir=>['shared','backend'].map(name=>path.join(dir,name)));
   const hook=`import fs from 'node:fs';import path from 'node:path';const read=fs.readdirSync;
-    fs.readdirSync=function(dir,...rest){if(['shared','backend'].includes(path.basename(String(dir))))throw new Error('Out-of-scope traversal');return read.call(this,dir,...rest);};`;
+    const guarded=new Set(${JSON.stringify(guarded)});
+    fs.readdirSync=function(dir,...rest){if(guarded.has(path.resolve(String(dir))))throw new Error('Out-of-scope traversal');return read.call(this,dir,...rest);};`;
   for(const [baseline,candidate] of [['HEAD','worktree'],['worktree','HEAD'],['HEAD',backup],[backup,'HEAD']]) {
     const run=execute('verify',[...args(root),'--baseline',baseline,'--candidate',candidate],
       {nodeArgs:['--import',`data:text/javascript,${encodeURIComponent(hook)}`]});
@@ -1244,6 +1248,13 @@ test('audit F1: scoped import resolution agrees across Git, worktree, and direct
     assert.equal(run.data.complete,true);
     assert.equal(run.data.summaryCounts.importOrderChanges,0);
     assert.ok(run.data.comparisons.every(c=>c.entry.startsWith('frontend/')));
+  }
+  // A deliberate whole-tree walk must still trip the guard on either source.
+  for(const side of ['worktree',backup]) {
+    const broad=execute('verify',[...args(root),'--scope','.','--baseline',side,'--candidate',side],
+      {nodeArgs:['--import',`data:text/javascript,${encodeURIComponent(hook)}`]});
+    assert.equal(broad.status,3);
+    assert.match(broad.stderr,/Out-of-scope traversal/);
   }
   fs.unlinkSync(path.join(root,'shared/_choice.ts'));
   const changed=execute('verify',args(root));
